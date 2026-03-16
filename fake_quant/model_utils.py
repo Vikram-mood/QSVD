@@ -81,6 +81,12 @@ def get_llava(model_name, hf_token=None):
                     device_map='cpu',
                 )
         model.seqlen=2048
+        # Add num_patches to vision_tower for compatibility with QSVD scripts
+        if hasattr(model, 'vision_tower') and not hasattr(model.vision_tower, 'num_patches'):
+            config = model.vision_tower.config
+            model.vision_tower.num_patches = (config.image_size // config.patch_size) ** 2
+            logging.info(f"Set model.vision_tower.num_patches to {model.vision_tower.num_patches}")
+        
         processor = LlavaNextProcessor.from_pretrained(model_name)
         if hf_token =='train_fix':
             return model, 'hf_v16_train_fix', processor
@@ -427,16 +433,23 @@ class LNRotWrapper(torch.nn.Module):
         x = self.module(x)
         if self.online_random_had:
             if self.fp32_had:
-                x = (x.double()@self.had_K).to(x_dtype)
+                x = (x.double()@self.had_K.to(x.device)).to(x_dtype)
             else:
-                x = x@self.had_K.to(x_dtype)
+                x = x@self.had_K.to(x.device, x_dtype)
         # Rotate, if needed
         if self.online_full_had:
             import hadamard_utils
-            if self.fp32_had: # Full Hadamard in FP32
-                x = hadamard_utils.matmul_hadU_cuda(x.float(), self.had_K, self.K).to(x_dtype)
-            else: # Full Hadamard in FP16
-                x = hadamard_utils.matmul_hadU_cuda(x, self.had_K, self.K)
+            if x.is_cuda:
+                if self.fp32_had: # Full Hadamard in FP32
+                    x = hadamard_utils.matmul_hadU_cuda(x.float(), self.had_K.to(x.device), self.K).to(x_dtype)
+                else: # Full Hadamard in FP16
+                    x = hadamard_utils.matmul_hadU_cuda(x, self.had_K.to(x.device), self.K)
+            else:
+                # CPU fallback
+                if self.fp32_had:
+                    x = hadamard_utils.matmul_hadU(x.float()).to(x_dtype)
+                else:
+                    x = hadamard_utils.matmul_hadU(x)
         return x.to(x_dtype)
 
 def get_layer_io_save_path(args):

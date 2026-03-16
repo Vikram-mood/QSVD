@@ -296,17 +296,29 @@ class ActQuantWrapper(torch.nn.Module):
                     x = x @ self.had_K.to(x_dtype)
         # Rotate, if needed
         if self.online_full_had:
-            
-            if self.fp32_had: # Full Hadamard in FP32
-                x = hadamard_utils.matmul_hadU_cuda(x.float(), self.had_K, self.K).to(x_dtype)
-            else: # Full Hadamard in FP16
-                x = hadamard_utils.matmul_hadU_cuda(x, self.had_K, self.K)
+            import hadamard_utils
+            if x.is_cuda:
+                if self.fp32_had: # Full Hadamard in FP32
+                    x = hadamard_utils.matmul_hadU_cuda(x.float(), self.had_K, self.K).to(x_dtype)
+                else: # Full Hadamard in FP16
+                    x = hadamard_utils.matmul_hadU_cuda(x, self.had_K, self.K)
+            else:
+                if self.fp32_had:
+                    x = hadamard_utils.matmul_hadU(x.float()).to(x_dtype)
+                else:
+                    x = hadamard_utils.matmul_hadU(x)
         if self.online_full_hadnopow2:
-            
-            if self.fp32_had: # Full Hadamard in FP32
-                x = hadamard_utils.matmul_hadU_cuda_nopow2(x.float(), self.had_K, self.K).to(x_dtype)
-            else: # Full Hadamard in FP16
-                x = hadamard_utils.matmul_hadU_cuda_nopow2(x, self.had_K, self.K)
+            import hadamard_utils
+            if x.is_cuda:
+                if self.fp32_had: # Full Hadamard in FP32
+                    x = hadamard_utils.matmul_hadU_cuda_nopow2(x.float(), self.had_K, self.K).to(x_dtype)
+                else: # Full Hadamard in FP16
+                    x = hadamard_utils.matmul_hadU_cuda_nopow2(x, self.had_K, self.K)
+            else:
+                if self.fp32_had:
+                    x = hadamard_utils.matmul_hadU(x.float()).to(x_dtype)
+                else:
+                    x = hadamard_utils.matmul_hadU(x)
                  
         elif self.online_partial_had:
             # todo: implement this in QAttention to avoid reshaping!
@@ -316,8 +328,12 @@ class ActQuantWrapper(torch.nn.Module):
                 
             init_shape = x.shape
             if self.K == 1:
-                x = fast_hadamard_transform.hadamard_transform(x.reshape(-1, init_shape[-1]//self.had_dim, self.had_dim).transpose(1, 2),
-                                                               scale=1/math.sqrt(init_shape[-1]//self.had_dim)).transpose(1, 2)
+                if x.is_cuda:
+                    x = fast_hadamard_transform.hadamard_transform(x.reshape(-1, init_shape[-1]//self.had_dim, self.had_dim).transpose(1, 2),
+                                                                   scale=1/math.sqrt(init_shape[-1]//self.had_dim)).transpose(1, 2)
+                else:
+                    import hadamard_utils
+                    x = hadamard_utils.matmul_hadU(x.reshape(-1, init_shape[-1]//self.had_dim, self.had_dim).transpose(1, 2)).transpose(1, 2)
             else:
                 x = (self.had_K.to(x.dtype) @ x.reshape(-1, init_shape[-1]//self.had_dim, self.had_dim)) / math.sqrt(init_shape[-1]//self.had_dim)
                 
@@ -741,11 +757,17 @@ class Actfp8QuantWrapper(torch.nn.Module):
 
         # Rotate, if needed
         if self.online_full_had:
-            
-            if self.fp32_had: # Full Hadamard in FP32
-                x = hadamard_utils.matmul_hadU_cuda(x.float(), self.had_K, self.K).to(x_dtype)
-            else: # Full Hadamard in FP16
-                x = hadamard_utils.matmul_hadU_cuda(x, self.had_K, self.K)
+            import hadamard_utils
+            if x.is_cuda:
+                if self.fp32_had: # Full Hadamard in FP32
+                    x = hadamard_utils.matmul_hadU_cuda(x.float(), self.had_K, self.K).to(x_dtype)
+                else: # Full Hadamard in FP16
+                    x = hadamard_utils.matmul_hadU_cuda(x, self.had_K, self.K)
+            else:
+                if self.fp32_had:
+                    x = hadamard_utils.matmul_hadU(x.float()).to(x_dtype)
+                else:
+                    x = hadamard_utils.matmul_hadU(x)
             
         elif self.online_partial_had:
             # todo: implement this in QAttention to avoid reshaping!
@@ -755,8 +777,12 @@ class Actfp8QuantWrapper(torch.nn.Module):
                 
             init_shape = x.shape
             if self.K == 1:
-                x = fast_hadamard_transform.hadamard_transform(x.reshape(-1, init_shape[-1]//self.had_dim, self.had_dim).transpose(1, 2),
-                                                               scale=1/math.sqrt(init_shape[-1]//self.had_dim)).transpose(1, 2)
+                if x.is_cuda:
+                    x = fast_hadamard_transform.hadamard_transform(x.reshape(-1, init_shape[-1]//self.had_dim, self.had_dim).transpose(1, 2),
+                                                                   scale=1/math.sqrt(init_shape[-1]//self.had_dim)).transpose(1, 2)
+                else:
+                    import hadamard_utils
+                    x = hadamard_utils.matmul_hadU(x.reshape(-1, init_shape[-1]//self.had_dim, self.had_dim).transpose(1, 2)).transpose(1, 2)
             else:
                 x = (self.had_K.to(x.dtype) @ x.reshape(-1, init_shape[-1]//self.had_dim, self.had_dim)) / math.sqrt(init_shape[-1]//self.had_dim)
                 

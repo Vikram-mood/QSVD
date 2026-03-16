@@ -7,13 +7,9 @@ import utils
 import quant_utils
 import model_utils
 import logging
-
 torch.backends.cuda.matmul.allow_tf32 = False
 torch.backends.cudnn.allow_tf32 = False
-
-
 class GPTQ:
-
     def __init__(self, layer):
         self.layer = layer
         self.dev = self.layer.weight.device
@@ -22,7 +18,6 @@ class GPTQ:
         self.columns = W.shape[1]
         self.H = torch.zeros((self.columns, self.columns), device=self.dev)
         self.nsamples = 0
-
     def add_batch(self, inp, out):
         
         if len(inp.shape) == 2:
@@ -37,24 +32,19 @@ class GPTQ:
         inp = math.sqrt(2 / self.nsamples) * inp.float()
         # self.H += 2 / self.nsamples * inp.matmul(inp.t())
         self.H += inp.matmul(inp.t())
-
     def fasterquant(
         self, blocksize=128, percdamp=.01, groupsize=-1, actorder=False, static_groups=False
     ):
         W = self.layer.weight.data.clone()
         W = W.float()
-
         tick = time.time()
-
         if not self.quantizer.ready():
             self.quantizer.find_params(W)
-
         H = self.H
         del self.H
         dead = torch.diag(H) == 0
         H[dead, dead] = 1
         W[:, dead] = 0
-
         if static_groups:
             import copy
             groups = []
@@ -62,16 +52,13 @@ class GPTQ:
                 quantizer = copy.deepcopy(self.quantizer)
                 quantizer.find_params(W[:, i:(i + groupsize)])
                 groups.append(quantizer)
-
         if actorder:
             perm = torch.argsort(torch.diag(H), descending=True)
             W = W[:, perm]
             H = H[perm][:, perm]
             invperm = torch.argsort(perm)
-
         Losses = torch.zeros_like(W)
         Q = torch.zeros_like(W)
-
         damp = percdamp * torch.mean(torch.diag(H))
         diag = torch.arange(self.columns, device=self.dev)
         H[diag, diag] += damp
@@ -79,21 +66,17 @@ class GPTQ:
         H = torch.cholesky_inverse(H)
         H = torch.linalg.cholesky(H, upper=True)
         Hinv = H
-
         for i1 in range(0, self.columns, blocksize):
             i2 = min(i1 + blocksize, self.columns)
             count = i2 - i1
-
             W1 = W[:, i1:i2].clone()
             Q1 = torch.zeros_like(W1)
             Err1 = torch.zeros_like(W1)
             Losses1 = torch.zeros_like(W1)
             Hinv1 = Hinv[i1:i2, i1:i2]
-
             for i in range(count):
                 w = W1[:, i]
                 d = Hinv1[i, i]
-
                 if groupsize != -1:
                     if not static_groups:
                         if (i1 + i) % groupsize == 0:
@@ -103,39 +86,30 @@ class GPTQ:
                         if actorder:
                             idx = perm[idx]
                         self.quantizer = groups[idx // groupsize]
-
                 q = self.quantizer.quantize(w.unsqueeze(1)).flatten()
                 Q1[:, i] = q
                 Losses1[:, i] = (w - q) ** 2 / d ** 2
-
                 err1 = (w - q) / d
                 W1[:, i:] -= err1.unsqueeze(1).matmul(Hinv1[i, i:].unsqueeze(0))
                 Err1[:, i] = err1
-
             Q[:, i1:i2] = Q1
             Losses[:, i1:i2] = Losses1 / 2
-
             W[:, i2:] -= Err1.matmul(Hinv[i1:i2, i2:])
-
         torch.cuda.synchronize()
-
         if actorder:
             Q = Q[:, invperm]
-
         self.layer.weight.data = Q.reshape(self.layer.weight.shape).to(self.layer.weight.data.dtype)
         if torch.any(torch.isnan(self.layer.weight.data)):
             logging.warning('NaN in weights')
             import pprint
             pprint.pprint(self.quantizer.bits, self.quantizer.scale, self.quantizer.zero_point)
             raise ValueError('NaN in weights')
-
     def free(self):
         self.H = None
         self.Losses = None
         self.Trace = None
         torch.cuda.empty_cache()
         utils.cleanup_memory(verbos=False)
-        
         
 @torch.no_grad()
 def gptq_fwrd(model, dataloader, dev, args):
@@ -145,20 +119,17 @@ def gptq_fwrd(model, dataloader, dev, args):
     '''
     logging.info('-----GPTQ Quantization-----')
     
-    use_cache = model.config.use_cache
-    model.config.use_cache = False
-    layers = model.model.layers
-
-    model.model.embed_tokens = model.model.embed_tokens.to(dev)
-    model.model.norm = model.model.norm.to(dev)
-    layers[0] = layers[0].to(dev)
-
+    use_cache = getattr(model.config, "use_cache", False)
+    if hasattr(model.config, "use_cache"): model.config.use_cache = False
+    layers = model.language_model.layers
+    # model.language_model.embed_tokens = model.language_model.embed_tokens.to(dev)
+    # model.language_model.norm = model.language_model.norm.to(dev)
+    # layers[0] = layers[0].to(dev) # Keep on CPU for capturing
     dtype = next(iter(model.parameters())).dtype
     inps = torch.zeros(
         (args.nsamples, model.seqlen, model.config.hidden_size), dtype=dtype, device=dev
     )
     cache = {'i': 0, 'attention_mask': None}
-
     class Catcher(nn.Module):
         def __init__(self, module):
             super().__init__()
@@ -176,16 +147,13 @@ def gptq_fwrd(model, dataloader, dev, args):
         except ValueError:
             pass
     layers[0] = layers[0].module
-
     layers[0] = layers[0].cpu()
-    model.model.embed_tokens = model.model.embed_tokens.cpu()
-    model.model.norm = model.model.norm.cpu()
+    model.language_model.embed_tokens = model.language_model.embed_tokens.cpu()
+    model.language_model.norm = model.language_model.norm.cpu()
     torch.cuda.empty_cache()
-
     outs = torch.zeros_like(inps)
     attention_mask = cache['attention_mask']
     position_ids = cache['position_ids']
-
     quantizers = {}
     sequential = [
                 ['self_attn.k_proj.module', 'self_attn.v_proj.module', 'self_attn.q_proj.module'],
@@ -199,7 +167,6 @@ def gptq_fwrd(model, dataloader, dev, args):
         full = quant_utils.find_qlayers(layer, layers=[torch.nn.Linear])
         for names in sequential:
             subset = {n: full[n] for n in names}
-
             gptq = {}
             for name in subset:
                 print(f'{name}', end='  ', flush=True)
@@ -215,7 +182,6 @@ def gptq_fwrd(model, dataloader, dev, args):
                 gptq[name].quantizer.configure(
                     layer_weight_bits, perchannel=True, sym=layer_weight_sym, mse=args.w_clip
                 )
-
             def add_batch(name):
                 def tmp(_, inp, out):
                     gptq[name].add_batch(inp[0].data, out.data)
@@ -224,10 +190,9 @@ def gptq_fwrd(model, dataloader, dev, args):
             for name in subset:
                 handles.append(subset[name].register_forward_hook(add_batch(name)))
             for j in range(args.nsamples):
-                outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_mask, position_ids=position_ids)[0]
+                outs[j] = layer(inps[j].unsqueeze(0).to(dev), attention_mask=attention_mask, position_ids=position_ids)[0]
             for h in handles:
                 h.remove()
-
             for name in subset:
                 layer_w_groupsize = args.w_groupsize
                 gptq[name].fasterquant(
@@ -236,23 +201,17 @@ def gptq_fwrd(model, dataloader, dev, args):
                 )
                 quantizers['model.layers.%d.%s' % (i, name)] = gptq[name].quantizer
                 gptq[name].free()
-
         for j in range(args.nsamples):
-            outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_mask, position_ids=position_ids)[0]
-
+            outs[j] = layer(inps[j].unsqueeze(0).to(dev), attention_mask=attention_mask, position_ids=position_ids)[0]
         layers[i] = layer.cpu()
         del layer
         del gptq 
         torch.cuda.empty_cache()
-
         inps, outs = outs, inps
-
-    model.config.use_cache = use_cache
+    if hasattr(model.config, "use_cache"): model.config.use_cache = use_cache
     utils.cleanup_memory(verbos=True)
     logging.info('-----GPTQ Quantization Done-----\n')
     return quantizers
-
-
 @torch.no_grad()
 def gptq_fwrdllava(model, dataloader, dev, args, tokenizer=None, image_processor=None):
     '''
@@ -261,34 +220,32 @@ def gptq_fwrdllava(model, dataloader, dev, args, tokenizer=None, image_processor
     '''
     logging.info('-----GPTQ Quantization-----')
     dataloader, _ = dataloader
-    use_cache = model.config.use_cache
-    model.config.use_cache = False
-    layers = model.model.layers
-
-    model.model.embed_tokens = model.model.embed_tokens.to(dev)
-    model.model.norm = model.model.norm.to(dev)
-    model.model.rotary_emb = model.model.rotary_emb.to(dev)
-    model.model.mm_projector = model.model.mm_projector.to(dev)
-    model.model.vision_tower = model.model.vision_tower.to(dev)
-    layers[0] = layers[0].to(dev)
-
+    use_cache = getattr(model.config, "use_cache", False)
+    if hasattr(model.config, "use_cache"): model.config.use_cache = False
+    layers = model.language_model.layers
+    # model.language_model.embed_tokens = model.language_model.embed_tokens.to(dev)
+    # model.language_model.norm = model.language_model.norm.to(dev)
+    # model.language_model.rotary_emb = model.language_model.rotary_emb.to(dev)
+    # model.multi_modal_projector = model.multi_modal_projector.to(dev)
+    # model.vision_tower = model.vision_tower.to(dev)
+    # layers[0] = layers[0].to(dev) # Keep on CPU for capturing
     dtype = next(iter(model.parameters())).dtype
     # inps = torch.zeros(
     #     (args.nsamples, model.seqlen, model.config.hidden_size), dtype=dtype, device=dev
     # )
     inps = []
     cache = {'i': 0, 'attention_mask': [], 'position_embeddings':[]}
-
     class Catcher(nn.Module):
         def __init__(self, module):
             super().__init__()
             self.module = module
         def forward(self, inp, **kwargs):
             # inps[cache['i']] = inp
-            inps.append(inp[0])
+            inps.append(inp[0].cpu())
             cache['i'] += 1
-            cache['attention_mask'].append(kwargs['attention_mask'].cpu())
-            cache['position_embeddings'].append(kwargs['position_embeddings'])
+            mask = kwargs.get('attention_mask')
+            cache['attention_mask'].append(mask.cpu() if mask is not None else None)
+            cache['position_embeddings'].append(kwargs.get('position_embeddings'))
             raise ValueError
     layers[0] = Catcher(layers[0])
     for batch in dataloader:
@@ -298,27 +255,23 @@ def gptq_fwrdllava(model, dataloader, dev, args, tokenizer=None, image_processor
             from llava.constants import IMAGE_TOKEN_INDEX
             # num_images = (input_ids == IMAGE_TOKEN_INDEX).sum()
             # print(num_images)
-            model.generate(input_ids, images=images,
-                            do_sample=False,
-                            temperature=0,
-                            max_new_tokens=512,
-                            use_cache=True,)
+            if hasattr(input_ids, 'items'):
+                model(**input_ids)
+            else:
+                model(input_ids, images=images)
         except ValueError:
             pass
     layers[0] = layers[0].module
-
     layers[0] = layers[0].cpu()
-    model.model.embed_tokens = model.model.embed_tokens.cpu()
-    model.model.norm = model.model.norm.cpu()
-    model.model.rotary_emb = model.model.rotary_emb.cpu()
-    model.model.mm_projector = model.model.mm_projector.cpu()
-    model.model.vision_tower = model.model.vision_tower.cpu()
+    model.language_model.embed_tokens = model.language_model.embed_tokens.cpu()
+    model.language_model.norm = model.language_model.norm.cpu()
+    model.language_model.rotary_emb = model.language_model.rotary_emb.cpu()
+    model.multi_modal_projector = model.multi_modal_projector.cpu()
+    model.vision_tower = model.vision_tower.cpu()
     torch.cuda.empty_cache()
-
     outs = [None] * args.nsamples 
     attention_mask = cache['attention_mask']
     position_embeddings = cache['position_embeddings'] # should be on the fly generated
-
     quantizers = {}
     sequential = [
                 ['self_attn.k_proj.module', 'self_attn.v_proj.module', 'self_attn.q_proj.module'],
@@ -330,9 +283,31 @@ def gptq_fwrdllava(model, dataloader, dev, args, tokenizer=None, image_processor
         print(f'\nLayer {i}:', flush=True, end=' ')
         layer = layers[i].to(dev)
         full = quant_utils.find_qlayers(layer, layers=[torch.nn.Linear])
-        for names in sequential:
+        # Dynamically expand sequential groups to support SVDLinear (ALinear/BLinear)
+        new_sequential = []
+        for group in sequential:
+            is_svd = any(name.replace(".module", ".BLinear.module") in full for name in group)
+            if is_svd:
+                # Stage 1: BLinear layers (and any non-SVD layers in the same group)
+                b_group = []
+                for name in group:
+                    svd_name = name.replace(".module", ".BLinear.module")
+                    if svd_name in full:
+                        b_group.append(svd_name)
+                    elif name in full:
+                        b_group.append(name)
+                if b_group: new_sequential.append(b_group)
+                
+                # Stage 2: ALinear layers
+                a_group = [name.replace(".module", ".ALinear.module") for name in group 
+                          if name.replace(".module", ".ALinear.module") in full]
+                if a_group: new_sequential.append(a_group)
+            else:
+                new_sequential.append([n for n in group if n in full])
+        
+        for names in new_sequential:
+            if not names: continue
             subset = {n: full[n] for n in names}
-
             gptq = {}
             for name in subset:
                 print(f'{name}', end='  ', flush=True)
@@ -348,7 +323,6 @@ def gptq_fwrdllava(model, dataloader, dev, args, tokenizer=None, image_processor
                 gptq[name].quantizer.configure(
                     layer_weight_bits, perchannel=True, sym=layer_weight_sym, mse=args.w_clip
                 )
-
             def add_batch(name):
                 def tmp(_, inp, out):
                     gptq[name].add_batch(inp[0].data, out.data)
@@ -359,11 +333,11 @@ def gptq_fwrdllava(model, dataloader, dev, args, tokenizer=None, image_processor
             for j in range(args.nsamples):
                 # attention_mask = inps. 
                 # position_embeddings = 
-                outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_mask[j].to(dev), position_embeddings=position_embeddings[j])[0][0]
+                mask = attention_mask[j]
+                outs[j] = layer(inps[j].unsqueeze(0).to(dev), attention_mask=mask.to(dev) if mask is not None else None, position_embeddings=position_embeddings[j])[0][0].cpu()
                 
             for h in handles:
                 h.remove()
-
             for name in subset:
                 layer_w_groupsize = args.w_groupsize
                 gptq[name].fasterquant(
@@ -371,23 +345,19 @@ def gptq_fwrdllava(model, dataloader, dev, args, tokenizer=None, image_processor
                 )
                 quantizers['model.layers.%d.%s' % (i, name)] = gptq[name].quantizer
                 gptq[name].free()
-
         for j in range(args.nsamples):
-            outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_mask[j].to(dev), position_embeddings=position_embeddings[j])[0][0]# as we have list instead of tensor
-
+            mask = attention_mask[j]
+            outs[j] = layer(inps[j].unsqueeze(0).to(dev), attention_mask=mask.to(dev) if mask is not None else None, position_embeddings=position_embeddings[j])[0][0].cpu()# as we have list instead of tensor
         layers[i] = layer.cpu()
         del layer
         del gptq 
         torch.cuda.empty_cache()
-
         inps, outs = outs, inps
-
-    model.config.use_cache = use_cache
+    if hasattr(model.config, "use_cache"): model.config.use_cache = use_cache
     utils.cleanup_memory(verbos=True)
     logging.info('-----GPTQ Quantization Done-----\n')
     return quantizers
        
-
 @torch.no_grad()
 def gptq_fwrdvit(model, dataloader, dev, args, tokenizer=None, image_processor=None):
     '''
@@ -396,35 +366,36 @@ def gptq_fwrdvit(model, dataloader, dev, args, tokenizer=None, image_processor=N
     '''
     logging.info('-----GPTQ vit Quantization-----')
     dataloader, _ = dataloader
-    use_cache = model.config.use_cache
-    model.config.use_cache = False
-    layers = model.model.vision_tower.vision_tower.vision_model.encoder.layers
-
-    # model.model.embed_tokens = model.model.embed_tokens.to(dev)
-    # model.model.norm = model.model.norm.to(dev)
-    # model.model.rotary_emb = model.model.rotary_emb.to(dev)
-    # model.model.mm_projector = model.model.mm_projector.to(dev)
-    layers[0] = layers[0].to(dev)
-
-    dtype = next(iter(model.model.vision_tower.vision_tower.vision_model.parameters())).dtype
+    use_cache = getattr(model.config, "use_cache", False)
+    if hasattr(model.config, "use_cache"): model.config.use_cache = False
+    layers = model.vision_tower.vision_model.encoder.layers
+    # # model.language_model.embed_tokens = model.language_model.embed_tokens.to(dev)
+    # # model.language_model.norm = model.language_model.norm.to(dev)
+    # # model.language_model.rotary_emb = model.language_model.rotary_emb.to(dev)
+    # # model.multi_modal_projector = model.multi_modal_projector.to(dev)
+    # layers[0] = layers[0].to(dev) # Keep on CPU for capturing
+    dtype = next(iter(model.vision_tower.vision_model.parameters())).dtype
     # inps = torch.zeros(
     #     (args.nsamples, model.seqlen, model.config.hidden_size), dtype=dtype, device=dev
     # )
     inps = torch.zeros(
-        (args.nsamples, model.model.vision_tower.num_patches+1, model.model.vision_tower.config.hidden_size), dtype=dtype, device=dev
+        (args.nsamples, model.vision_tower.num_patches+1, model.vision_tower.config.hidden_size), dtype=dtype, device="cpu"
     )
     cache = {'i': 0, 'attention_mask': [], 'position_embeddings':[]}
-
     class Catcher(nn.Module):
         def __init__(self, module):
             super().__init__()
             self.module = module
         def forward(self, inp, *args, **kwargs):
-            inps[cache['i']] = inp
-            # inps.append(inp[0])
-            cache['i'] += 1
-            # cache['attention_mask'].append(kwargs['attention_mask'].cpu())
-            # cache['position_embeddings'].append(kwargs['position_embeddings'])
+            remaining = inps.shape[0] - cache['i']
+            if remaining > 0:
+                capture_size = min(remaining, inp.shape[0])
+                if inp.shape[0] == 1:
+                    inps[cache['i']] = inp[0].to(inps.device)
+                    cache['i'] += 1
+                else:
+                    inps[cache['i']:cache['i']+capture_size] = inp[:capture_size].to(inps.device)
+                    cache['i'] += capture_size
             raise ValueError
     layers[0] = Catcher(layers[0])
     for batch in dataloader:
@@ -434,26 +405,22 @@ def gptq_fwrdvit(model, dataloader, dev, args, tokenizer=None, image_processor=N
             from llava.constants import IMAGE_TOKEN_INDEX
             # num_images = (input_ids == IMAGE_TOKEN_INDEX).sum()
             # print(num_images)
-            model.generate(input_ids, images=images,
-                            do_sample=False,
-                            temperature=0,
-                            max_new_tokens=512,
-                            use_cache=True,)
+            if hasattr(input_ids, 'items'):
+                model(**input_ids)
+            else:
+                model(input_ids, images=images)
         except ValueError:
             pass
     layers[0] = layers[0].module
-
     layers[0] = layers[0].cpu()
-    # model.model.embed_tokens = model.model.embed_tokens.cpu()
-    # model.model.norm = model.model.norm.cpu()
-    # model.model.rotary_emb = model.model.rotary_emb.cpu()
-    # model.model.mm_projector = model.model.mm_projector.cpu()
+    # model.language_model.embed_tokens = model.language_model.embed_tokens.cpu()
+    # model.language_model.norm = model.language_model.norm.cpu()
+    # model.language_model.rotary_emb = model.language_model.rotary_emb.cpu()
+    # model.multi_modal_projector = model.multi_modal_projector.cpu()
     torch.cuda.empty_cache()
-
     outs = torch.zeros_like(inps)
     # attention_mask = cache['attention_mask']
     # position_embeddings = cache['position_embeddings'] # should be on the fly generated
-
     quantizers = {}
     sequential = [
                 ['self_attn.k_proj.module', 'self_attn.v_proj.module', 'self_attn.q_proj.module'],
@@ -465,9 +432,31 @@ def gptq_fwrdvit(model, dataloader, dev, args, tokenizer=None, image_processor=N
         print(f'\nLayer {i}:', flush=True, end=' ')
         layer = layers[i].to(dev)
         full = quant_utils.find_qlayers(layer, layers=[torch.nn.Linear])
-        for names in sequential:
+        # Dynamically expand sequential groups to support SVDLinear (ALinear/BLinear)
+        new_sequential = []
+        for group in sequential:
+            is_svd = any(name.replace(".module", ".BLinear.module") in full for name in group)
+            if is_svd:
+                # Stage 1: BLinear layers (and any non-SVD layers in the same group)
+                b_group = []
+                for name in group:
+                    svd_name = name.replace(".module", ".BLinear.module")
+                    if svd_name in full:
+                        b_group.append(svd_name)
+                    elif name in full:
+                        b_group.append(name)
+                if b_group: new_sequential.append(b_group)
+                
+                # Stage 2: ALinear layers
+                a_group = [name.replace(".module", ".ALinear.module") for name in group 
+                          if name.replace(".module", ".ALinear.module") in full]
+                if a_group: new_sequential.append(a_group)
+            else:
+                new_sequential.append([n for n in group if n in full])
+        
+        for names in new_sequential:
+            if not names: continue
             subset = {n: full[n] for n in names}
-
             gptq = {}
             for name in subset:
                 print(f'{name}', end='  ', flush=True)
@@ -483,7 +472,6 @@ def gptq_fwrdvit(model, dataloader, dev, args, tokenizer=None, image_processor=N
                 gptq[name].quantizer.configure(
                     layer_weight_bits, perchannel=True, sym=layer_weight_sym, mse=args.w_clip
                 )
-
             def add_batch(name):
                 def tmp(_, inp, out):
                     gptq[name].add_batch(inp[0].data, out.data)
@@ -494,11 +482,10 @@ def gptq_fwrdvit(model, dataloader, dev, args, tokenizer=None, image_processor=N
             for j in range(args.nsamples):
                 # attention_mask = inps. 
                 # position_embeddings = 
-                outs[j] = layer(inps[j].unsqueeze(0), None, None)[0]
+                outs[j] = layer(inps[j].unsqueeze(0).to(dev), None, None)[0]
                 
             for h in handles:
                 h.remove()
-
             for name in subset:
                 layer_w_groupsize = args.w_groupsize
                 gptq[name].fasterquant(
@@ -507,23 +494,17 @@ def gptq_fwrdvit(model, dataloader, dev, args, tokenizer=None, image_processor=N
                 )
                 quantizers['model.layers.%d.%s' % (i, name)] = gptq[name].quantizer
                 gptq[name].free()
-
         for j in range(args.nsamples):
-            outs[j] = layer(inps[j].unsqueeze(0), None, None)[0]
-
+            outs[j] = layer(inps[j].unsqueeze(0).to(dev), None, None)[0]
         layers[i] = layer.cpu()
         del layer
         del gptq 
         torch.cuda.empty_cache()
-
         inps, outs = outs, inps
-
-    model.config.use_cache = use_cache
+    if hasattr(model.config, "use_cache"): model.config.use_cache = use_cache
     utils.cleanup_memory(verbos=True)
     logging.info('-----GPTQ vit Quantization Done-----\n')
     return quantizers
-
-
 @torch.no_grad()
 def gptq_fwrdmm(model, dataloader, dev, args, tokenizer=None, image_processor=None):
     '''
@@ -532,68 +513,125 @@ def gptq_fwrdmm(model, dataloader, dev, args, tokenizer=None, image_processor=No
     '''
     logging.info('-----GPTQ mm Quantization-----')
     dataloader, _ = dataloader
-    use_cache = model.config.use_cache
-    model.config.use_cache = False
+    use_cache = getattr(model.config, "use_cache", False)
+    if hasattr(model.config, "use_cache"): model.config.use_cache = False
+    is_llava_next_hf = (type(model) == model_utils.LLAVA_NEXT_HF)
     layers = model.model
-
-    model.model.vision_tower.vision_tower.vision_model.encoder.layers = model.model.vision_tower.vision_tower.vision_model.encoder.layers.to(dev)
-    layer = layers.mm_projector.to(dev)
+    # model.vision_tower.vision_model.encoder.layers = model.vision_tower.vision_model.encoder.layers.to(dev)
+    layer = getattr(model, 'multi_modal_projector', getattr(model.model, 'mm_projector', None)) # .to(dev)
     dtype = next(iter(model.parameters())).dtype
+    seqlen = model.vision_tower.num_patches if is_llava_next_hf else model.vision_tower.num_patches + 1
     inps = torch.zeros(
-        (args.nsamples, model.model.vision_tower.num_patches, model.model.vision_tower.config.hidden_size), dtype=dtype, device=dev
+        (args.nsamples, seqlen, model.vision_tower.config.hidden_size), dtype=dtype, device="cpu"
     )
     cache = {'i': 0, 'attention_mask': [], 'position_embeddings':[]}
-
     class Catcher(nn.Module):
         def __init__(self, module):
             super().__init__()
-            self.module = module
+            self.proj = module
         def forward(self, inp, *args, **kwargs):
-            inps[cache['i']] = inp
-            # inps.append(inp[0])
-            cache['i'] += 1
-            # cache['attention_mask'].append(kwargs['attention_mask'].cpu())
-            # cache['position_embeddings'].append(kwargs['position_embeddings'])
+            remaining = inps.shape[0] - cache['i']
+            if remaining > 0:
+                capture_size = min(remaining, inp.shape[0])
+                if inp.shape[0] == 1:
+                    inps[cache['i']] = inp[0].to(inps.device)
+                    cache['i'] += 1
+                else:
+                    inps[cache['i']:cache['i']+capture_size] = inp[:capture_size].to(inps.device)
+                    cache['i'] += capture_size
             raise ValueError
-    layers.mm_projector = Catcher(layers.mm_projector)
+    if is_llava_next_hf:
+        projector = model.model.multi_modal_projector
+    else:
+        projector = getattr(model, 'multi_modal_projector', getattr(model.model, 'mm_projector', None))
+    projector_catcher = Catcher(projector)
+    
+    if is_llava_next_hf:
+        model.model.multi_modal_projector = projector_catcher
+        logging.info(f"Catcher installed on llava_next projector, type={type(model.model.multi_modal_projector)}")
+    elif hasattr(model, 'multi_modal_projector'): 
+        model.multi_modal_projector = projector_catcher
+        logging.info(f"Catcher installed on projector, type={type(model.multi_modal_projector)}")
+    elif hasattr(model.model, 'mm_projector'): 
+        model.model.mm_projector = projector_catcher
+        logging.info(f"Catcher installed on mm_projector, type={type(model.model.mm_projector)}")
     for batch in dataloader:
         try:
             # model(batch[0].to(dev))
             input_ids, images = message_to_prompt(batch, image_processor, model, tokenizer)
-            from llava.constants import IMAGE_TOKEN_INDEX
-            # num_images = (input_ids == IMAGE_TOKEN_INDEX).sum()
-            # print(num_images)
-            model.generate(input_ids, images=images,
-                            do_sample=False,
-                            temperature=0,
-                            max_new_tokens=512,
-                            use_cache=True,)
+            if hasattr(input_ids, 'items'):
+                model(**input_ids)
+            else:
+                from llava.constants import IMAGE_TOKEN_INDEX
+                model(input_ids, images=images)
         except ValueError:
             pass
-    # layers[0] = layers[0].module
-    layers.mm_projector = layers.mm_projector.module # remove catcher
-
+        except Exception as e:
+            logging.warning(f"gptq_fwrdmm: non-ValueError during forward: {type(e).__name__}: {e}")
+            pass
+    # Safely unwrap the Catcher — check if it's still a Catcher before accessing .proj
+    if is_llava_next_hf:
+        if isinstance(model.model.multi_modal_projector, Catcher):
+            model.model.multi_modal_projector = model.model.multi_modal_projector.proj
+        else:
+            logging.warning(f"llava_next model.model.multi_modal_projector is not a Catcher (type={type(model.model.multi_modal_projector)}), skipping unwrap")
+    elif hasattr(model, 'multi_modal_projector'):
+        if isinstance(model.multi_modal_projector, Catcher):
+            model.multi_modal_projector = model.multi_modal_projector.proj
+        else:
+            logging.warning(f"multi_modal_projector is not a Catcher (type={type(model.multi_modal_projector)}), skipping unwrap")
+    elif hasattr(model.model, 'mm_projector'):
+        if isinstance(model.model.mm_projector, Catcher):
+            model.model.mm_projector = model.model.mm_projector.proj
+        else:
+            logging.warning(f"mm_projector is not a Catcher (type={type(model.model.mm_projector)}), skipping unwrap")
     layer = layer.cpu()
-    model.model.vision_tower.vision_tower.vision_model.encoder.layers = model.model.vision_tower.vision_tower.vision_model.encoder.layers.cpu()
+    model.vision_tower.vision_model.encoder.layers = model.vision_tower.vision_model.encoder.layers.cpu()
     torch.cuda.empty_cache()
-
+    out_hidden_size = model.config.text_config.hidden_size if is_llava_next_hf else model.config.hidden_size
     outs = torch.zeros(
-        (args.nsamples, model.model.vision_tower.num_patches, model.model.config.hidden_size), dtype=dtype, device=dev
+        (args.nsamples, seqlen, out_hidden_size), dtype=dtype, device="cpu"
     )
     # attention_mask = cache['attention_mask']
     # position_embeddings = cache['position_embeddings'] # should be on the fly generated
-
     quantizers = {}
-    sequential = [
-                ['0.module'],
-                ['2.module'],
-            ]
-
+    if is_llava_next_hf:
+        sequential = [
+                    ['linear_1.module'],
+                    ['linear_2.module'],
+                ]
+    else:
+        sequential = [
+                    ['0.module'],
+                    ['2.module'],
+                ]
     layer = layer.to(dev)
     full = quant_utils.find_qlayers(layer, layers=[torch.nn.Linear])
-    for names in sequential:
+    # Dynamically expand sequential groups to support SVDLinear (ALinear/BLinear)
+    new_sequential = []
+    for group in sequential:
+        is_svd = any(name.replace(".module", ".BLinear.module") in full for name in group)
+        if is_svd:
+            # Stage 1: BLinear layers (and any non-SVD layers in the same group)
+            b_group = []
+            for name in group:
+                svd_name = name.replace(".module", ".BLinear.module")
+                if svd_name in full:
+                    b_group.append(svd_name)
+                elif name in full:
+                    b_group.append(name)
+            if b_group: new_sequential.append(b_group)
+            
+            # Stage 2: ALinear layers
+            a_group = [name.replace(".module", ".ALinear.module") for name in group 
+                      if name.replace(".module", ".ALinear.module") in full]
+            if a_group: new_sequential.append(a_group)
+        else:
+            new_sequential.append([n for n in group if n in full])
+    
+    for names in new_sequential:
+        if not names: continue
         subset = {n: full[n] for n in names}
-
         gptq = {}
         for name in subset:
             print(f'{name}', end='  ', flush=True)
@@ -604,7 +642,6 @@ def gptq_fwrdmm(model, dataloader, dev, args, tokenizer=None, image_processor=No
             gptq[name].quantizer.configure(
                 layer_weight_bits, perchannel=True, sym=layer_weight_sym, mse=args.w_clip
             )
-
         def add_batch(name):
             def tmp(_, inp, out):
                 gptq[name].add_batch(inp[0].data, out.data)
@@ -615,34 +652,31 @@ def gptq_fwrdmm(model, dataloader, dev, args, tokenizer=None, image_processor=No
         for j in range(args.nsamples):
             # attention_mask = inps. 
             # position_embeddings = 
-            outs[j] = layer(inps[j].unsqueeze(0))[0]
+            outs[j] = layer(inps[j].unsqueeze(0).to(dev))[0]
             
         for h in handles:
             h.remove()
-
         for name in subset:
             layer_w_groupsize = args.w_groupsize
             gptq[name].fasterquant(
                 percdamp=args.percdamp, groupsize=layer_w_groupsize, actorder=args.act_order, static_groups=False
             )
-            quantizers['model.model.mm_projector.%s' % (name)] = gptq[name].quantizer
+            quantizers['model.multi_modal_projector.%s' % (name)] = gptq[name].quantizer
             gptq[name].free()
-
     # for j in range(args.nsamples):
-    #     outs[j] = layer(inps[j].unsqueeze(0))[0]
-
-    layers.mm_projector = layer.cpu()
+    #     outs[j] = layer(inps[j].unsqueeze(0).to(dev))[0]
+    if is_llava_next_hf:
+        model.multi_modal_projector = layer.cpu()
+    else:
+        layers.mm_projector = layer.cpu()
     del layer
     del gptq 
     torch.cuda.empty_cache()
-
     inps, outs = outs, inps
-
-    model.config.use_cache = use_cache
+    if hasattr(model.config, "use_cache"): model.config.use_cache = use_cache
     utils.cleanup_memory(verbos=True)
     logging.info('-----GPTQ mm Quantization Done-----\n')
     return quantizers
-
 @torch.no_grad()
 def rtn_fwrd(model, dev, args, start_id=0):
     '''
@@ -652,15 +686,11 @@ def rtn_fwrd(model, dev, args, start_id=0):
     assert args.w_groupsize ==-1, "Groupsize not supported in RTN!"
     layers = model_utils.get_layers(model)
     torch.cuda.empty_cache()
-
     quantizers = {}
-
     for i in tqdm.tqdm(range(start_id, len(layers)), desc="(RtN Quant.) Layers"):
         layer = layers[i].to(dev)
-
         subset = quant_utils.find_qlayers(layer,
                                             layers=[torch.nn.Linear])
-
         for name in subset:
             layer_weight_bits = args.w_bits
             if 'lm_head' in name:
@@ -668,7 +698,6 @@ def rtn_fwrd(model, dev, args, start_id=0):
                 continue
             if args.int8_down_proj and 'down_proj' in name:
                 layer_weight_bits = 8
-
             quantizer = quant_utils.WeightQuantizer()
             quantizer.configure(
                 layer_weight_bits, perchannel=True, sym=not(args.w_asym), mse=args.w_clip
@@ -684,8 +713,6 @@ def rtn_fwrd(model, dev, args, start_id=0):
             
     utils.cleanup_memory(verbos=True)
     return quantizers
-
-
 @torch.no_grad()
 def rtn_fwrdvit(model, dev, args, start_id=0):
     '''
@@ -696,17 +723,13 @@ def rtn_fwrdvit(model, dev, args, start_id=0):
     if type(model) ==  model_utils.LLAVA_NEXT_HF:
         layers = model.vision_tower.vision_model.encoder.layers
     else:
-        layers = model.model.vision_tower.vision_tower.vision_model.encoder.layers
+        layers = model.vision_tower.vision_model.encoder.layers
     torch.cuda.empty_cache()
-
     quantizers = {}
-
     for i in tqdm.tqdm(range(start_id, len(layers)), desc="(RtN vit Quant.) Layers"):
         layer = layers[i].to(dev)
-
         subset = quant_utils.find_qlayers(layer,
                                             layers=[torch.nn.Linear])
-
         for name in subset:
             layer_weight_bits = args.w_bits
             if 'lm_head' in name:
@@ -714,7 +737,6 @@ def rtn_fwrdvit(model, dev, args, start_id=0):
                 continue
             if args.int8_down_proj and 'down_proj' in name:
                 layer_weight_bits = 8
-
             quantizer = quant_utils.WeightQuantizer()
             quantizer.configure(
                 layer_weight_bits, perchannel=True, sym=not(args.w_asym), mse=args.w_clip
@@ -730,9 +752,6 @@ def rtn_fwrdvit(model, dev, args, start_id=0):
             
     utils.cleanup_memory(verbos=True)
     return quantizers
-
-
-
 @torch.no_grad()
 def rtn_fwrdmm(model, dev, args):
     '''
@@ -742,18 +761,15 @@ def rtn_fwrdmm(model, dev, args):
     assert args.w_groupsize ==-1, "Groupsize not supported in RTN!"
     
     torch.cuda.empty_cache()
-
     quantizers = {}
     if type(model) ==  model_utils.LLAVA_NEXT_HF:
         layer = model.multi_modal_projector
         layer = layer.to(dev)
     else:
         layers = model.model
-        layer = layers.mm_projector.to(dev)
-
+        layer = getattr(model, 'multi_modal_projector', getattr(model.model, 'mm_projector', None)) # .to(dev)
     subset = quant_utils.find_qlayers(layer,
                                         layers=[torch.nn.Linear])
-
     for name in subset:
         layer_weight_bits = args.w_bits
         if 'lm_head' in name:
@@ -761,7 +777,6 @@ def rtn_fwrdmm(model, dev, args):
             continue
         if args.int8_down_proj and 'down_proj' in name:
             layer_weight_bits = 8
-
         quantizer = quant_utils.WeightQuantizer()
         quantizer.configure(
             layer_weight_bits, perchannel=True, sym=not(args.w_asym), mse=args.w_clip
@@ -771,7 +786,7 @@ def rtn_fwrdmm(model, dev, args):
         quantizer.find_params(W)
         subset[name].weight.data = quantizer.quantize(W).to(
             dtype)
-        quantizers['model.model.mm_projector.%s' % (name)] = quantizer.cpu()
+        quantizers['model.multi_modal_projector.%s' % (name)] = quantizer.cpu()
     if type(model) ==  model_utils.LLAVA_NEXT_HF:
         layer = layer.cpu()
     else:
@@ -781,18 +796,15 @@ def rtn_fwrdmm(model, dev, args):
             
     utils.cleanup_memory(verbos=True)
     return quantizers
-
 def insert_ignore_index_after_prompt(input_ids, output_ids, image_token_id=32000, ignore_index=-100):
     """
     In output_ids, after the prompt part and before the image token part,
     insert the corresponding number of ignore_index (-100) for masking during loss calculation.
-
     Args:
         input_ids (torch.Tensor): shape (seq_len,)
         output_ids (torch.Tensor): shape (seq_len,)
         image_token_id (int): image placeholder token id, default 32000, for HF's LLaVANextProcessor
         ignore_index (int): marker to be ignored by CrossEntropyLoss, default -100
-
     Returns:
         torch.Tensor: processed output_ids with ignore_index segment
     """
@@ -801,22 +813,16 @@ def insert_ignore_index_after_prompt(input_ids, output_ids, image_token_id=32000
     if len(image_positions[0]) == 0:
         # No image token, return original output_ids
         return output_ids.clone()
-
     first_image_idx = image_positions[0][0].item()
     num_image_tokens = (input_ids == image_token_id).sum().item()
-
     # Split prompt and the rest
     prompt_output_ids = output_ids[:first_image_idx]
     rest_output_ids = output_ids[first_image_idx:]
-
     # Construct ignore_index segment
     ignore_prefix = torch.full((num_image_tokens,), ignore_index, dtype=output_ids.dtype, device=output_ids.device)
-
     # Concatenate
     final_output_ids = torch.cat([prompt_output_ids, ignore_prefix, rest_output_ids], dim=0)
-
     return final_output_ids
-
 def insert_ignore_index_for_smolvlm(input_ids, labels, fake_token_id=49152, image_token_id=49153, ignore_index=-100):
     """
     Set label mask for SmolVLM model, handling its special image token structure.
@@ -880,7 +886,7 @@ def message_to_prompt(message, image_processor, model, tokenizer):
         )
         inputs = image_processor(
             text=prompt, images=images, return_tensors="pt"
-        ).to("cuda")
+        ).to(next(model.parameters()).device)
         return inputs, None
     elif 'hf_v16' in str(tokenizer):
         content, images = [], []
@@ -900,7 +906,7 @@ def message_to_prompt(message, image_processor, model, tokenizer):
         conversation, add_generation_prompt=True
         )
         inputs = image_processor(prompt, images, return_tensors="pt").to(
-                    "cuda", torch.float16)
+                    next(model.parameters()).device, torch.float16)
         return inputs, None
     system_prompt = (
             "A chat between a curious human and an artificial intelligence assistant. "
@@ -920,17 +926,15 @@ def message_to_prompt(message, image_processor, model, tokenizer):
     images = [Image.open(s).convert("RGB") for s in images]
     if images:
         image_tensor = process_images(images, image_processor, model.config).to(
-            utils.get_dev(), dtype=torch.float16
+            next(model.parameters()).device, dtype=torch.float16
         )
         image_sizes = [img.size for img in images] # for llava 1.6// one vision
     else:
         image_tensor = None
         image_sizes = None
     prompt = system_prompt + "USER: " + content + " ASSISTANT: "
-    input_ids = tokenizer_image_token(prompt, tokenizer, IMAGE_TOKEN_INDEX, return_tensors='pt').unsqueeze(0).to(utils.get_dev())
+    input_ids = tokenizer_image_token(prompt, tokenizer, IMAGE_TOKEN_INDEX, return_tensors='pt').unsqueeze(0).to(next(model.parameters()).device)
     return input_ids, (image_tensor, image_sizes)
-
-
 def message_to_prompt_train(message, image_processor, model, tokenizer, label_mode="qa-qa"):
     from llava.mm_utils import (
         process_images,
@@ -967,21 +971,18 @@ def message_to_prompt_train(message, image_processor, model, tokenizer, label_mo
             else images
         )
         if label_mode == 'q-a':
-            inputs = image_processor(text=prompt, images=images, return_tensors="pt").to("cuda") # IMAGE TOKEN + Question
-            answer = image_processor(text=anw, return_tensors="pt").to("cuda") # Answer
+            inputs = image_processor(text=prompt, images=images, return_tensors="pt").to("cpu") # IMAGE TOKEN + Question
+            answer = image_processor(text=anw, return_tensors="pt").to("cpu") # Answer
             return inputs, None, answer # to accommodate llava input?
         elif label_mode == 'qa-qa':
             question_prompt = prompt
             prompt += anw
-
-            inputs = image_processor(text=prompt, images=images, return_tensors="pt").to("cuda", torch.float16) # image + question + answer
-            question_token = image_processor(text=question_prompt, images=images, return_tensors="pt").to("cuda", torch.float16) # image + question
+            inputs = image_processor(text=prompt, images=images, return_tensors="pt").to("cpu") # image + question + answer
+            question_token = image_processor(text=question_prompt, images=images, return_tensors="pt").to("cpu") # image + question
             
             question_ids = question_token['input_ids'].clone()
             input_ids = inputs['input_ids'].clone()
-
             labels = inputs['input_ids'].clone()
-
             # Find the position of the question part in the complete input
             # If the question is always at the beginning, directly use the length of the question
             question_length = question_ids.size(1)
@@ -989,12 +990,10 @@ def message_to_prompt_train(message, image_processor, model, tokenizer, label_mo
             # breakpoint()
             if image_processor.tokenizer.pad_token_id is not None:
                 labels[labels == image_processor.tokenizer.pad_token_id] = -100
-
             inputs['input_ids'] = inputs['input_ids'][:,:-1]
             labels = labels[:,1:]
             # breakpoint()
             return inputs, None, labels
-
     elif tokenizer == 'hf_v16':
         if label_mode == 'q-a':
             content, images = [], []
@@ -1007,7 +1006,6 @@ def message_to_prompt_train(message, image_processor, model, tokenizer, label_mo
                 else:
                     content.append({"type": "image"})
                     images.append(Image.open(msg["value"]).convert("RGB"))
-
             conversation = [
                 {
                     "role": "user",
@@ -1021,16 +1019,14 @@ def message_to_prompt_train(message, image_processor, model, tokenizer, label_mo
                 }
             ]
             prompt = image_processor.apply_chat_template(conversation, add_generation_prompt=True)
-            inputs = image_processor(prompt, images, return_tensors="pt").to("cuda", torch.float16) # IMAGE TOKEN + Question  
+            inputs = image_processor(prompt, images, return_tensors="pt").to("cpu") # IMAGE TOKEN + Question  
             
             answer = image_processor.apply_chat_template(
                 answer, # add_generation_prompt=True # whether here add generation prompt?
             )
-            answer = image_processor(answer, return_tensors="pt").to("cuda", torch.float16) # Answer
-
+            answer = image_processor(answer, return_tensors="pt").to("cpu") # Answer
             input_ids = inputs.get('input_ids')
             output_ids = answer.get('input_ids')
-
             final_output_ids = insert_ignore_index_after_prompt(input_ids[0],output_ids[0], image_token_id=32000, ignore_index=-100) # This image_token_id is for LLaVANextProcessor
             # Create a new output_ids tensor, size matching final_output_ids
             new_output_ids = torch.full((output_ids.size(0), final_output_ids.size(0)), 
@@ -1041,7 +1037,6 @@ def message_to_prompt_train(message, image_processor, model, tokenizer, label_mo
             new_output_ids[0] = final_output_ids
             # Replace original output_ids
             output_ids = new_output_ids # labels
-
             return inputs, None, output_ids
         elif label_mode == 'qa-qa':
             content, images = [], []
@@ -1056,7 +1051,6 @@ def message_to_prompt_train(message, image_processor, model, tokenizer, label_mo
                 else:
                     content.append({"type": "image"})
                     images.append(Image.open(msg["value"]).convert("RGB"))
-
             conversation = [
                 {
                     "role": "user",
@@ -1078,23 +1072,19 @@ def message_to_prompt_train(message, image_processor, model, tokenizer, label_mo
                 }
             ]
             prompt = image_processor.apply_chat_template(conversation, add_generation_prompt=False)
-            inputs = image_processor(prompt, images, return_tensors="pt").to("cuda", torch.float16) # image + question + answer
+            inputs = image_processor(prompt, images, return_tensors="pt").to("cpu") # image + question + answer
             question_prompt = image_processor.apply_chat_template(question, add_generation_prompt=False)
-            question_token = image_processor(question_prompt, images, return_tensors="pt").to("cuda", torch.float16) # image + question
+            question_token = image_processor(question_prompt, images, return_tensors="pt").to("cpu") # image + question
             
             question_ids = question_token['input_ids'].clone()
             input_ids = inputs['input_ids'].clone()
-
             labels = inputs['input_ids'].clone()
-
             # Find the position of the question part in the complete input
             # If the question is always at the beginning, directly use the length of the question
             question_length = question_ids.size(1)
             labels[:, :question_length-1] = IGNORE_INDEX # mask image and question, keep all answer with "question_length-1"
-
             if image_processor.tokenizer.pad_token_id is not None:
                 labels[labels == image_processor.tokenizer.pad_token_id] = -100
-
             # inputs["labels"] = labels
             # breakpoint()
             inputs['input_ids'] = inputs['input_ids'][:,:-1]
@@ -1112,7 +1102,6 @@ def message_to_prompt_train(message, image_processor, model, tokenizer, label_mo
             else:
                 content.append({"type": "image"})
                 images.append(Image.open(msg["value"]).convert("RGB"))
-
         conversation = [
             {
                 "role": "user",
@@ -1127,7 +1116,7 @@ def message_to_prompt_train(message, image_processor, model, tokenizer, label_mo
         conversation, add_generation_prompt=False, tokenize=False,
         )
         inputs = image_processor(prompt, images, return_tensors="pt", padding=True).to(
-                    "cuda", torch.float16)
+                    next(model.parameters()).device, torch.float16)
         labels = inputs['input_ids'].clone()
         if image_processor.tokenizer.pad_token_id is not None:
             # pad_token_id = image_processor.tokenizer.pad_token_id
@@ -1155,19 +1144,16 @@ def message_to_prompt_train(message, image_processor, model, tokenizer, label_mo
     images = [Image.open(s).convert("RGB") for s in images]
     if images:
         image_tensor = process_images(images, image_processor, model.config).to(
-            utils.get_dev(), dtype=torch.float16
+            next(model.parameters()).device, dtype=torch.float16
         )
         image_sizes = [img.size for img in images] # for llava 1.6// one vision
     else:
         image_tensor = None
         image_sizes = None
     prompt = system_prompt + "USER: " + content + " ASSISTANT: "
-    input_ids = tokenizer_image_token(prompt, tokenizer, IMAGE_TOKEN_INDEX, return_tensors='pt').unsqueeze(0).to(utils.get_dev())
-    answer = tokenizer_image_token(anw, tokenizer, IMAGE_TOKEN_INDEX, return_tensors='pt').unsqueeze(0).to(utils.get_dev())
+    input_ids = tokenizer_image_token(prompt, tokenizer, IMAGE_TOKEN_INDEX, return_tensors='pt').unsqueeze(0).to(next(model.parameters()).device)
+    answer = tokenizer_image_token(anw, tokenizer, IMAGE_TOKEN_INDEX, return_tensors='pt').unsqueeze(0).to("cpu")
     return input_ids, (image_tensor, image_sizes), answer
-
-
-
 def message_to_promptsmolvlm(message, image_processor, model, tokenizer):
     if tokenizer is None:
         from transformers.image_utils import load_image
@@ -1195,9 +1181,8 @@ def message_to_promptsmolvlm(message, image_processor, model, tokenizer):
         )
         inputs = image_processor(
             text=prompt, images=images, return_tensors="pt"
-        ).to("cuda")
+        ).to(next(model.parameters()).device)
         return inputs
-
 def message_to_prompt_trainsmolvlm(message, image_processor, model, tokenizer):
     if tokenizer is None:
         from transformers.image_utils import load_image
@@ -1228,11 +1213,9 @@ def message_to_prompt_trainsmolvlm(message, image_processor, model, tokenizer):
         )
         inputs = image_processor(
             text=prompt, images=images, return_tensors="pt"
-        ).to("cuda")
-        answer = image_processor(text=anw, return_tensors="pt").to("cuda")
+        ).to(next(model.parameters()).device)
+        answer = image_processor(text=anw, return_tensors="pt").to("cpu")
         return inputs, None,  answer # to accommodate llava input?
-
-
 @torch.no_grad()
 def rtn_fwrdsmovlmvit(model, dev, args, start_id=0):
     '''
@@ -1242,15 +1225,11 @@ def rtn_fwrdsmovlmvit(model, dev, args, start_id=0):
     assert args.w_groupsize ==-1, "Groupsize not supported in RTN!"
     layers = model.model.vision_model.encoder.layers
     torch.cuda.empty_cache()
-
     quantizers = {}
-
     for i in tqdm.tqdm(range(start_id, len(layers)), desc="(RtN vit Quant.) Layers"):
         layer = layers[i].to(dev)
-
         subset = quant_utils.find_qlayers(layer,
                                             layers=[torch.nn.Linear])
-
         for name in subset:
             layer_weight_bits = args.w_bits
             if 'lm_head' in name:
@@ -1258,7 +1237,6 @@ def rtn_fwrdsmovlmvit(model, dev, args, start_id=0):
                 continue
             if args.int8_down_proj and 'fc2' in name:
                 layer_weight_bits = 8
-
             quantizer = quant_utils.WeightQuantizer()
             quantizer.configure(
                 layer_weight_bits, perchannel=True, sym=not(args.w_asym), mse=args.w_clip
@@ -1274,8 +1252,6 @@ def rtn_fwrdsmovlmvit(model, dev, args, start_id=0):
     del layers
     utils.cleanup_memory(verbos=True)
     return quantizers
-
-
 @torch.no_grad()
 def rtn_fwrdsmovlmmm(model, dev, args):
     '''
@@ -1285,15 +1261,10 @@ def rtn_fwrdsmovlmmm(model, dev, args):
     assert args.w_groupsize ==-1, "Groupsize not supported in RTN!"
     
     torch.cuda.empty_cache()
-
     quantizers = {}
-
-
     layer = model.model.connector.to(dev)
-
     subset = quant_utils.find_qlayers(layer,
                                         layers=[torch.nn.Linear])
-
     for name in subset:
         layer_weight_bits = args.w_bits
         if 'lm_head' in name:
@@ -1301,7 +1272,6 @@ def rtn_fwrdsmovlmmm(model, dev, args):
             continue
         if args.int8_down_proj and 'down_proj' in name:
             layer_weight_bits = 8
-
         quantizer = quant_utils.WeightQuantizer()
         quantizer.configure(
             layer_weight_bits, perchannel=True, sym=not(args.w_asym), mse=args.w_clip
@@ -1318,6 +1288,4 @@ def rtn_fwrdsmovlmmm(model, dev, args):
             
     utils.cleanup_memory(verbos=True)
     return quantizers
-
-
     

@@ -894,6 +894,52 @@ def svd_qkv_with_grad_info(layers, args, use_cache=True, cache_file=None):
     logging.info(f"Selected top {len(top_indices)} important singular values")
     return top_indices, top_scores, layer_indices_dict
 
+def svd_qkv_with_magnitude_info(layers, args):
+    """
+    Perform SVD decomposition on QKV layer fusion and utilize ONLY singular value magnitude
+    to construct importance scores for global rank allocation.
+    
+    Args:
+        layers: List of model layers
+        args: Parameter configuration
+    
+    Returns:
+        top_indices, top_scores, layer_indices_dict
+    """
+    # Ensure SVD is prepared
+    # We call prepare_qkv_svd here if it hasn't been called. 
+    # Usually it's called in calib_grad_info but magnitude mode skips calibration.
+    # Check first layer
+    if not hasattr(layers[0].self_attn, 'qkv_svd_info'):
+        # We need the model object to call prepare_qkv_svd usually, 
+        # but the logic inside prepare_qkv_svd just needs the layers.
+        # However, for simplicity, we assume prepare_qkv_svd was called in svd_lm_setup.
+        pass
+
+    grad_scores_dict = {}
+    for idx, layer in enumerate(layers):
+        if hasattr(layer.self_attn, 'qkv_svd_info'):
+            svd_info = layer.self_attn.qkv_svd_info
+            # Use raw S magnitude as the importance score
+            importance_score = torch.abs(svd_info['S']).cpu().to(torch.float32)
+            layer_key = f"layer_{idx}"
+            grad_scores_dict[layer_key] = importance_score
+            
+            print(f"Layer {idx} magnitude importance score computed, shape: {importance_score.shape}")
+        else:
+            print(f"Warning: Layer {idx} lacks necessary SVD information") 
+
+    # Get indices and scores of top k important singular values
+    num_layers = len(layers)
+    hidden_size = layers[0].self_attn.q_proj.in_features
+    total_rank = num_layers * hidden_size
+    k_value = int(args.rank_ratio/2 * total_rank) 
+    
+    top_indices, top_scores, layer_indices_dict = get_top_k_scores(grad_scores_dict, k=k_value)
+    
+    logging.info(f"Magnitude Mode: Selected top {len(top_indices)} important singular values")
+    return top_indices, top_scores, layer_indices_dict
+
 # Add the following functions at the end of the file
 
 def get_top_k_scores(grad_scores_dict, k):

@@ -1,3 +1,4 @@
+#!/bin/bash
 source /data1/vikram/miniconda3/etc/profile.d/conda.sh
 conda activate QSVD
 cd /data1/vikram/QSVD/QSVD
@@ -13,8 +14,8 @@ python -u /data1/vikram/QSVD/QSVD/fake_quant/mainllavanext.py \
     --w_rtn \
     --w_clip \
     --a_clip_ratio 0.9 \
-    --nsamples 256 \
-    --vitnsamples 256 \
+    --nsamples 10 \
+    --vitnsamples 10 \
     --seed 0 \
     --svd_mode 0.2 \
     --qkv_fuse \
@@ -33,4 +34,14 @@ python -u /data1/vikram/QSVD/QSVD/fake_quant/mainllavanext.py \
     --vit_module \
     --grad_info \
     --beta_then_svd
+# Example: Run with Magnitude-based global rank allocation (Faster, TSVD-like)
+# python -u /data1/vikram/QSVD/QSVD/fake_quant/mainllavanext.py \
+#     --model llava-hf/llava-v1.6-vicuna-7b-hf  \
+#     --rank_ratio 1.5 \
+#     --svd_lm \
+#     --magnitude_info \
+#     --no-grad_info \
+#     --qkv_fuse \
+#     --setting "QSVD/sqa/magnitude_only_r1.5"
+
 echo "PYTHON_EXIT_CODE=$?"

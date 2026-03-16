@@ -52,33 +52,37 @@ def _profile(dataloader, args, model, image_processor, tokenizer, out=False):
             cache['i'] += 1
             raise ValueError
     
-    layers = model.vision_tower.vision_model.encoder.layers
-    model.vision_tower = model.vision_tower.to(utils.get_dev())
+    # layers = model.vision_tower.vision_model.encoder.layers
+    # model.vision_tower = model.vision_tower.to(utils.get_dev())
+    # layer = model.multi_modal_projector
+    # layer = layer.to(utils.get_dev())
     layer = model.multi_modal_projector
-    layer = layer.to(utils.get_dev())
 
     
     if out:
         layer.linear_1 = Catcherout(layer.linear_1)
     else:
         layer.linear_1 = Catcher(layer.linear_1)
-    model.language_model.embed_tokens = model.language_model.embed_tokens.to(utils.get_dev()) # llava next forward embedding before vit
+    # model.language_model.embed_tokens = model.language_model.embed_tokens.to(utils.get_dev()) # llava next forward embedding before vit
 
-    for batch in dataloader:
+    print(f"Starting _profile profiling with {len(dataloader)} batches")
+    for b_idx, batch in enumerate(dataloader):
+        if b_idx % 10 == 0:
+            print(f"Profiling batch {b_idx}/{len(dataloader)}", flush=True)
         try:
             inputs, _ = gptq_utils.message_to_prompt(batch, image_processor, model, tokenizer)
             # inputs = inputs.to(utils.get_dev())
             
             
-            model.generate(**inputs,
-                            max_new_tokens=1,
-                            use_cache=True,)
+            model(**inputs)
         except ValueError:
             pass
 
-    layer.linear_1 = layer.linear_1.module
-    layer = layer.cpu()
-    layers = layers.cpu()
+    # layer.linear_1 = layer.linear_1.module
+    # layer = layer.cpu()
+    # layers = layers.cpu()
+    if hasattr(layer.linear_1, 'module'):
+        layer.linear_1 = layer.linear_1.module
     if out:
         return inps, outs
     return inps
@@ -228,10 +232,16 @@ def main(args):
                     args=args
                 )# use the same or not
                 utils.set_seed(args.seed)
+                print("moving model to cpu for gptq_fwrdvit")
+                model.cpu()
+                torch.cuda.empty_cache()
                 quantizers = gptq_utils.gptq_fwrdvit(model, trainloader, utils.get_dev(), args, tokenizer, image_processor)
                 save_dict["w_vitquantizers"] = quantizers
                 if not args.vit_mmoff:
                     print("calling gptq_fwrdmm::::: in mainllavanext.py")
+                    print("moving model to cpu for gptq_fwrdmm")
+                    model.cpu()
+                    torch.cuda.empty_cache()
                     quantizers = gptq_utils.gptq_fwrdmm(model, trainloader, utils.get_dev(), args, tokenizer, image_processor)
                     save_dict["w_mmquantizers"] = quantizers
             else: # RTN Weight Quantization
@@ -375,6 +385,9 @@ def main(args):
                     seqlen=model.seqlen, eval_mode=False,
                     args=args
                 )
+                print("moving model to cpu for gptq_fwrdllava")
+                model.cpu()
+                torch.cuda.empty_cache()
                 print("calling gptq_fwrdllava::::: in mainllavanext.py")
                 quantizers = gptq_utils.gptq_fwrdllava(model, trainloader, utils.get_dev(), args, tokenizer, image_processor)
                 save_dict["w_quantizers"] = quantizers
