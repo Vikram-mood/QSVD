@@ -11,6 +11,7 @@ import hadamard_utils
 import svd_utils
 import profile_utils
 import logging
+import gc
 import os
 import torch.distributed as dist
 import datetime
@@ -397,6 +398,9 @@ def main(args):
 
         # Add Input Quantization
         if args.a_bits < 16 or args.v_bits < 16:
+            # Clear memory before starting activation quantization
+            gc.collect()
+            torch.cuda.empty_cache()
             print("calling a_bits < 16 or v_bits < 16::::: in mainllavanext.py")
             logging.info(f'setting a clip ratio in lm {min(args.a_clip_ratio, args.lma_clip_ratio)}')
             qlayers = quant_utils.find_qlayers(model, layers=[quant_utils.ActQuantWrapper])
@@ -474,6 +478,12 @@ def main(args):
             args=args
         )
     print("end of calling test_loader::::: in mainllavanext.py")
+    
+    if 'ScienceQA_TEST' in args.vlmtasks:
+        # Final cleanup before evaluation
+        gc.collect()
+        torch.cuda.empty_cache()
+        print("Evaluating on ScienceQA_TEST...")
 
     if 'scienceqa' in args.eval_dataset.lower():
         import eval_utilsdistllava

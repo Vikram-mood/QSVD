@@ -15,10 +15,18 @@ def evaluator(model, testenc, dev, args, tokenizer, image_processor):
     from vlmeval.smp import dump, get_rank_and_world_size, string, load
     from vlmeval.dataset import DATASET_TYPE
     import pandas as pd
+    import gc
     rank, world_size = get_rank_and_world_size()
     _, testenc = testenc
-    model = model.to(rank)
-    logging.info("moving model to dev")
+    
+    # Explicitly clear memory before moving model
+    gc.collect()
+    torch.cuda.empty_cache()
+    
+    # Use the passed dev instead of rank to be consistent with main script
+    if next(model.parameters()).device != torch.device(dev):
+        logging.info(f"moving model to {dev}")
+        model = model.to(dev)
 
 
     def build_prompt_llava(line, dataset):
@@ -87,7 +95,7 @@ def evaluator(model, testenc, dev, args, tokenizer, image_processor):
             conversation, add_generation_prompt=True
             )
             inputs = image_processor(prompt, images, return_tensors="pt").to(
-                        "cuda", torch.float16)
+                        dev, torch.float16)
             return inputs
         system_prompt = (
             "A chat between a curious human and an artificial intelligence assistant. "
@@ -110,12 +118,12 @@ def evaluator(model, testenc, dev, args, tokenizer, image_processor):
         args = abstractproperty()
         args.image_aspect_ratio = "pad"
         image_tensor = process_images(images, image_processor, args).to(
-            "cuda", dtype=torch.float16
+            dev, dtype=torch.float16
         )
 
         prompt = system_prompt + "USER: " + content + " ASSISTANT: "
         # ADD conv templets
-        input_ids = tokenizer_image_token(prompt, tokenizer, IMAGE_TOKEN_INDEX, return_tensors='pt').unsqueeze(0).cuda()
+        input_ids = tokenizer_image_token(prompt, tokenizer, IMAGE_TOKEN_INDEX, return_tensors='pt').unsqueeze(0).to(dev)
         stopping_criteria = KeywordsStoppingCriteria(
             ["</s>"], tokenizer, input_ids
         )

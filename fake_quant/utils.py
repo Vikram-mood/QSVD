@@ -193,12 +193,16 @@ def parser_gen():
         help='use act aware SVD with calibration')
     parser.add_argument('--act_alpha', type=float, default=0.5,
         help='sensitivity of ASVD S construction')
+    parser.add_argument('--latent_smooth', action=argparse.BooleanOptionalAction, default=False, 
+        help='Apply smoothing on the latent space for ASVD construction')
     parser.add_argument('--calib_method', type=str, default='abs_mean', choices=['abs_mean', 'abs_max', 'cholesky'], 
         help='calibation method for act aware SVD')
     parser.add_argument('--fisher_info', action=argparse.BooleanOptionalAction, default=False,
         help='calculate Fisher Information for rank allocations for each layer')
     parser.add_argument('--grad_info', action=argparse.BooleanOptionalAction, default=False,
         help='calculate Grad Information for rank allocations for each layer')
+    parser.add_argument('--magnitude_info', action=argparse.BooleanOptionalAction, default=False,
+        help='calculate Magnitude Information for rank allocations for each layer')
     parser.add_argument('--had_svd', action=argparse.BooleanOptionalAction, default=False, 
         help='had then svd')
     parser.add_argument('--had_rank', action=argparse.BooleanOptionalAction, default=False, 

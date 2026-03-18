@@ -939,6 +939,10 @@ def svd_lm_setup(model, args, tokenizer, image_processor):
             use_cache=args.use_cache,  # default enable cache
             cache_file=args.cache_file
         )
+
+    if args.magnitude_info:
+        # For magnitude mode, we just need the SVD decomposition results
+        grad_info_utils.prepare_qkv_svd(model, args)
     
     # Continue performing SVD compression
     model_type = model_utils.get_model_type(model)
@@ -956,10 +960,14 @@ def svd_lm_setup(model, args, tokenizer, image_processor):
     
 
     # layers = model_utils.get_transformer_layers(model, model_type=model_type)    
-    if args.grad_info:
+    if args.grad_info or args.magnitude_info:
         rank, world_size = get_rank_and_world_size()
-        top_indices, top_scores, layer_indices_dict = grad_info_utils.svd_qkv_with_grad_info(layers, args, use_cache=args.use_cache, cache_file=args.cache_file) # top_indices: (layer_idx, singular_value_idx)
-        for idx, layer in enumerate(tqdm.tqdm(layers, unit="layer", desc="LM SVD with grad info")):
+        if args.grad_info:
+            top_indices, top_scores, layer_indices_dict = grad_info_utils.svd_qkv_with_grad_info(layers, args, use_cache=args.use_cache, cache_file=args.cache_file) # top_indices: (layer_idx, singular_value_idx)
+        else:
+            top_indices, top_scores, layer_indices_dict = grad_info_utils.svd_qkv_with_magnitude_info(layers, args)
+        
+        for idx, layer in enumerate(tqdm.tqdm(layers, unit="layer", desc="LM SVD with global rank info")):
             full = quant_utils.find_qlayers(layers[idx], layers=[torch.nn.Linear])
             for name, module in full.items():
                 if args.qkv_fuse:

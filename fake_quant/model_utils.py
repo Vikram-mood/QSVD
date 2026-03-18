@@ -81,6 +81,11 @@ def get_llava(model_name, hf_token=None):
                     device_map='cpu',
                 )
         model.seqlen=2048
+        # Add num_patches to vision_tower for compatibility with QSVD scripts
+        if hasattr(model, 'vision_tower') and not hasattr(model.vision_tower, 'num_patches'):
+            config = model.vision_tower.config
+            model.vision_tower.num_patches = (config.image_size // config.patch_size) ** 2
+            logging.info(f"Set model.vision_tower.num_patches to {model.vision_tower.num_patches}")
         processor = LlavaNextProcessor.from_pretrained(model_name)
         if hf_token =='train_fix':
             return model, 'hf_v16_train_fix', processor

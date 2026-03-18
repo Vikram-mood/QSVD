@@ -153,14 +153,14 @@ def calib_grad_info(model, dataloader, tokenizer, image_processor, args, use_cac
             try:
                 # 1. Get raw inputs based on tokenizer type
                 if tokenizer is None: # SmolVLM
-                    inputs, _, output_ids = gptq_utils.message_to_prompt_train(batch, image_processor, model, tokenizer, label_mode=args.label_mode)
+                    inputs, _, output_ids = gptq_utils.message_to_prompt_train(batch, image_processor, model, tokenizer, device, label_mode=args.label_mode)
                 elif tokenizer == 'hf_v16': # LLaVA Next
-                    inputs, _, output_ids = gptq_utils.message_to_prompt_train(batch, image_processor, model, tokenizer, label_mode=args.label_mode)
+                    inputs, _, output_ids = gptq_utils.message_to_prompt_train(batch, image_processor, model, tokenizer, device, label_mode=args.label_mode)
                 elif 'hf_v16' in str(tokenizer): # handle 'hf_v16_trainfix'
-                    inputs, _, _ = gptq_utils.message_to_prompt_train(batch, image_processor, model, tokenizer, label_mode=args.label_mode)
+                    inputs, _, _ = gptq_utils.message_to_prompt_train(batch, image_processor, model, tokenizer, device, label_mode=args.label_mode)
                     output_ids = inputs.get('labels')
                 else: # LLaVA
-                    input_ids_raw, images, output_ids = gptq_utils.message_to_prompt_train(batch, image_processor, model, tokenizer)
+                    input_ids_raw, images, output_ids = gptq_utils.message_to_prompt_train(batch, image_processor, model, tokenizer, device)
                     inputs = {'input_ids': input_ids_raw}
                     if images is not None:
                         images_tensor, image_sizes = images
@@ -1025,3 +1025,88 @@ def visualize_layer_score_histograms(grad_scores_dict, save_path=None, max_layer
         print("Cannot import matplotlib, skipping visualization")
     except Exception as e:
         print(f"Error during visualization: {e}")
+
+def svd_qkv_with_magnitude_info(layers, args):
+    """
+    Perform SVD decomposition on QKV layer fusion and utilize ONLY singular value magnitude
+    to construct importance scores for global rank allocation.
+    
+    Args:
+        layers: List of model layers
+        args: Parameter configuration
+    
+    Returns:
+        top_indices, top_scores, layer_indices_dict
+    """
+    # Ensure SVD is prepared
+    # We call prepare_qkv_svd here if it hasn't been called. 
+    # Usually it's called in calib_grad_info but magnitude mode skips calibration.
+    # Check first layer
+    if not hasattr(layers[0].self_attn, 'qkv_svd_info'):
+        # We need the model object to call prepare_qkv_svd usually, 
+        # but the logic inside prepare_qkv_svd just needs the layers.
+        # However, for simplicity, we assume prepare_qkv_svd was called in svd_lm_setup.
+        pass
+
+    grad_scores_dict = {}
+    for idx, layer in enumerate(layers):
+        if hasattr(layer.self_attn, 'qkv_svd_info'):
+            svd_info = layer.self_attn.qkv_svd_info
+            # Use raw S magnitude as the importance score
+            importance_score = torch.abs(svd_info['S']).cpu().to(torch.float32)
+            layer_key = f"layer_{idx}"
+            grad_scores_dict[layer_key] = importance_score
+            
+            print(f"Layer {idx} magnitude importance score computed, shape: {importance_score.shape}")
+        else:
+            print(f"Warning: Layer {idx} lacks necessary SVD information") 
+
+    # Get indices and scores of top k important singular values
+    num_layers = len(layers)
+    hidden_size = layers[0].self_attn.q_proj.in_features
+    total_rank = num_layers * hidden_size
+    k_value = int(args.rank_ratio/2 * total_rank) 
+    
+    top_indices, top_scores, layer_indices_dict = get_top_k_scores(grad_scores_dict, k=k_value)
+    
+    logging.info(f"Magnitude Mode: Selected top {len(top_indices)} important singular values")
+    return top_indices, top_scores, layer_indices_dict
+
+def get_top_k_scores(grad_scores_dict, k):
+    """
+    Get indices and scores of top k important singular values across all layers
+    
+    Args:
+        grad_scores_dict: Dictionary containing gradient importance scores for each layer
+        k: Number of important singular values to select
+    
+    Returns:
+        top_indices: List of (layer_index, singular_value_index) tuples for top k important singular values
+        top_scores: List of corresponding importance scores
+        layer_indices_dict: Dictionary of selected singular value indices for each layer
+    """
+    # Collect scores from all layers
+    all_scores = []
+    for layer_idx, scores in grad_scores_dict.items():
+        layer_num = int(layer_idx.split('_')[1])
+        for i, score in enumerate(scores):
+            all_scores.append((layer_num, i, score.item()))
+    
+    # Sort by score in descending order
+    all_scores.sort(key=lambda x: x[2], reverse=True)
+    
+    # Select top k
+    top_k = all_scores[:k]
+    
+    # Separate indices and scores
+    top_indices = [(item[0], item[1]) for item in top_k]
+    top_scores = [item[2] for item in top_k]
+    
+    # Create index dictionary for each layer
+    layer_indices_dict = {}
+    for layer_idx, singular_idx in top_indices:
+        if layer_idx not in layer_indices_dict:
+            layer_indices_dict[layer_idx] = []
+        layer_indices_dict[layer_idx].append(singular_idx)
+    
+    return top_indices, top_scores, layer_indices_dict
