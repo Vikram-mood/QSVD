@@ -215,6 +215,8 @@ def parser_gen():
         help='how to set input and label for loss and grad')
     parser.add_argument('--profile_method', action=argparse.BooleanOptionalAction, default=False, 
         help='whether to skip the eval part, just to profile the model using calibrated dataset')
+    parser.add_argument('--latent_smooth', action=argparse.BooleanOptionalAction, default=False, 
+                        help='Apply latent smooth to SVDLinear (default: False)')
     parser.add_argument('--beta_then_svd', action=argparse.BooleanOptionalAction, default=False, 
         help='lm svd depend on vit output, so this decides whether svd happens before or after vit module')
 
