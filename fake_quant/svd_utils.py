@@ -1327,3 +1327,53 @@ def svd_llava_setup(model, args, tokenizer=None, image_processor=None):
                                                     seed=args.seed))
     
     logging.info("Language model SVD compression completed")
+
+def apply_weight_threshold(module, threshold_percentile):
+    """
+    Apply element-wise thresholding to the weight matrix of a linear module.
+    threshold_percentile: float in [0, 100]
+    """
+    if not hasattr(module, 'weight'):
+        return 0
+    
+    with torch.no_grad():
+        w = module.weight.data
+        abs_w = w.abs()
+        # Use torch.quantile for efficiency
+        # Convert to float for quantile, then get the value
+        threshold_value = torch.quantile(abs_w.float().view(-1), threshold_percentile / 100.0)
+        mask = abs_w >= threshold_value
+        module.weight.data = w * mask
+        
+        # Calculate sparsity
+        total_elements = w.numel()
+        zero_elements = torch.sum(module.weight.data == 0).item()
+        sparsity = (zero_elements / total_elements) * 100
+        return sparsity
+
+def calculate_model_sparsity(model):
+    """
+    Calculate the total sparsity of the model's linear layers.
+    """
+    total_elements = 0
+    zero_elements = 0
+    
+    for name, module in model.named_modules():
+        if isinstance(module, nn.Linear):
+            w = module.weight.data
+            total_elements += w.numel()
+            zero_elements += torch.sum(w == 0).item()
+            
+    if total_elements == 0:
+        return 0
+    return (zero_elements / total_elements) * 100
+
+def compute_gradient_importance_diag(U, V, G_w):
+    """
+    Compute importance score I_sigma = diag(U^T G_w V)
+    """
+    # diag(U^T G_w V) = sum(U * (G_w V), dim=0)
+    # Using sum(U * (G_w @ V), dim=0) is equivalent to taking diagonal of U.T @ G_w @ V
+    # but much more memory efficient as it avoids full NxN matrix construction
+    I_sigma = torch.sum(U * (G_w @ V), dim=0)
+    return I_sigma

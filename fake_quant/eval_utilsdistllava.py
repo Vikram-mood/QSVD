@@ -257,7 +257,7 @@ def evaluator(model, testenc, dev, args, tokenizer, image_processor):
         logging.info("Start evaluation!")
         result_file = args.save_path + '/vlm_result.xlsx'
         data_all = load(args.save_path + '/vlm_eval.pkl')
-        dataset = testenc.data
+        dataset = testenc.data.copy() # Use a copy to avoid modifying the original data in-place
 
         # Ensure all indices are covered
         for x in dataset['index']:
