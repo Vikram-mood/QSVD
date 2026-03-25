@@ -1,0 +1,25 @@
+To reproduce these results and see the comparison for yourself, you should run these two shell scripts:
+
+1. Magnitude-based approach
+Run this script to see the performance of the standard top-k singular value selection:
+
+bash
+bash run_magnitude.sh
+Log file: Check fake_quant/experiments/.../llavanext_magnitude_baseline/*.log
+Result CSV: fake_quant/experiments/.../llavanext_magnitude_baseline/vlm_result_acc.csv
+2. QSVD (Importance-based) approach
+Run this script to see the performance with gradient-aware importance scoring:
+
+bash
+bash run_qsvd_16bit.sh
+Log file: Check fake_quant/experiments/.../llavanext_qsvd_16bit_baseline/*.log
+Result CSV: fake_quant/experiments/.../llavanext_qsvd_16bit_baseline/vlm_result_acc.csv
+Key Differences in the Files:
+
+run_magnitude.sh
+: Does not include the --grad_info or --beta_then_svd flags. It performs a simple SVD truncation on the weight matrices.
+
+run_qsvd_16bit.sh
+: Includes --grad_info and --beta_then_svd. It first calculates the importance of each direction using gradients before performing the SVD.
+Both are configured with nsamples 128 and 16-bit precision to ensure they fit in your GPU memory and provide a fair comparison.
+
