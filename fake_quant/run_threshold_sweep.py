@@ -12,6 +12,9 @@ import pandas as pd
 from tqdm import tqdm
 import traceback
 import numpy as np
+import gptq_utils
+import quant_utils
+import rotation_utils
 
 def run_sweep():
     # Load environment and args
@@ -86,6 +89,53 @@ def run_sweep():
                 proj.weight.data.copy_(attention_weights_backup[(idx, name)].to(device))
                 if p > 0:
                     svd_utils.apply_weight_threshold(proj, p)
+        
+        # Apply Quantization
+        if args.w_bits < 16:
+            if args.w_rtn:
+                logging.info(f"Applying RTN {args.w_bits}-bit weight quantization...")
+                gptq_utils.rtn_fwrd(model, device, args)
+            else:
+                logging.info(f"Applying GPTQ {args.w_bits}-bit weight quantization...")
+                gptq_utils.gptq_fwrdllava(model, trainloader, device, args, tokenizer, image_processor)
+
+        if args.a_bits < 16 or args.v_bits < 16:
+            logging.info(f"Configuring {args.a_bits}-bit activation and {args.v_bits}-bit V-cache quantization...")
+            qlayers = quant_utils.find_qlayers(model, layers=[quant_utils.ActQuantWrapper])
+            down_proj_groupsize = -1
+            if args.a_groupsize > 0 and "llama" in args.model:
+                down_proj_groupsize = utils.llama_down_proj_groupsize(model, args.a_groupsize)
+            for name in qlayers:
+                layer_input_bits = args.a_bits
+                layer_groupsize = args.a_groupsize
+                layer_a_sym = not(args.a_asym)
+                layer_a_clip = min(args.a_clip_ratio, args.lma_clip_ratio)
+                
+                if 'v_proj' in name and args.v_bits < 16:
+                    qlayers[name].out_quantizer.configure(bits=args.v_bits,
+                                                groupsize=args.v_groupsize,
+                                                sym=not(args.v_asym),
+                                                clip_ratio=args.v_clip_ratio)
+                if 'lm_head' in name:
+                    layer_input_bits = 16
+                if 'down_proj' in name:
+                    layer_groupsize = down_proj_groupsize
+                qlayers[name].quantizer.configure(bits=layer_input_bits,
+                                                groupsize=layer_groupsize,
+                                                sym=layer_a_sym,
+                                                clip_ratio=layer_a_clip)
+
+        if args.k_bits < 16:
+            logging.info(f"Configuring {args.k_bits}-bit K-cache quantization...")
+            rope_function_name = model_utils.get_rope_function_name(model)
+            k_quant_config = {'k_bits':args.k_bits, "k_groupsize": args.k_groupsize,
+                                        "k_sym": not(args.k_asym), "k_clip_ratio": args.k_clip_ratio}
+            for layer in layers:
+                rotation_utils.add_qk_rotation_wrapper_after_function_call_in_forward(
+                            layer.self_attn, 
+                            rope_function_name, 
+                            config=model.config.text_config,
+                            **k_quant_config)
         
         # Calculate sparsity
         sparsity = svd_utils.calculate_model_sparsity(model)
