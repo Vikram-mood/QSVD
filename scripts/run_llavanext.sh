@@ -1,5 +1,5 @@
-wbits=4
-bits=4
+wbits=8
+bits=8
 aclipratio=0.9
 bs=4
 svd_mode=0.2

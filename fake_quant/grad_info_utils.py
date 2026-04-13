@@ -58,6 +58,7 @@ def insert_ignore_index_after_prompt(input_ids, output_ids, image_token_id=32000
     return final_output_ids
 
 @torch.enable_grad()
+# ///// Projection based approch (Ours)
 def calib_grad_info(model, dataloader, tokenizer, image_processor, args, use_cache=True, cache_file=None):
     """
     Calculate Grad matrix for each layer of the model to evaluate parameter importance
@@ -117,15 +118,10 @@ def calib_grad_info(model, dataloader, tokenizer, image_processor, args, use_cac
     # --------------------------------------------------------------------------
     device = utils.get_dev()
     
-    # Enable grad only for Q/K/V up front so gradients are allocated properly when model is moved
-    for name, param in model.named_parameters():
-        if 'model.layers' in name:
-            if 'q_proj' in name or 'k_proj' in name or 'v_proj' in name:
-                param.requires_grad = True
-            else:
-                param.requires_grad = False
-        else:
-            param.requires_grad = False
+    # Disable module weight gradients to avoid massive OOM allocations.
+    # The gradient flow will be maintained via inputs_embeds.requires_grad_(True)
+    for param in model.parameters():
+        param.requires_grad = False
 
     logging.info("Step 1: Pre-computing input embeddings to allow Vision Tower offloading")
     precomputed_batches = []
@@ -261,7 +257,7 @@ def calib_grad_info(model, dataloader, tokenizer, image_processor, args, use_cac
             model.multi_modal_projector = model.multi_modal_projector.cpu()
         torch.cuda.empty_cache()
     
-        logging.info("Step 3: Calculating gradients using precomputed embeddings")
+        logging.info("Step 3: Calculating gradient projections using activation hooks")
         model.train()
         batch_count = 0
         accumulation_steps = 1
@@ -269,12 +265,37 @@ def calib_grad_info(model, dataloader, tokenizer, image_processor, args, use_cac
         for batch_data in tqdm(precomputed_batches, desc="Computing Gradients"):
             try:
                 inputs_embeds = batch_data['inputs_embeds'].to(device)
+                inputs_embeds.requires_grad_(True)
+                
                 attention_mask = batch_data['attention_mask'].to(device)
                 labels = batch_data['labels'].to(device)
                 position_ids = batch_data['position_ids'].to(device) if batch_data['position_ids'] is not None else None
                 
+                hooks = []
+                captured_data = {}
+                
+                def get_forward_hook(idx):
+                    def hook(module, input, output):
+                        if idx not in captured_data:
+                            captured_data[idx] = {}
+                        captured_data[idx]['X'] = input[0].detach()
+                    return hook
+
+                def get_backward_hook(idx, proj_name):
+                    def hook(module, grad_input, grad_output):
+                        if idx not in captured_data:
+                            captured_data[idx] = {}
+                        captured_data[idx][f'gY_{proj_name}'] = grad_output[0].detach()
+                    return hook
+                
+                for idx, layer in enumerate(model_utils.get_layers(model)):
+                    if hasattr(layer.self_attn, 'qkv_svd_info'):
+                        hooks.append(layer.self_attn.v_proj.register_forward_hook(get_forward_hook(idx)))
+                        hooks.append(layer.self_attn.q_proj.register_full_backward_hook(get_backward_hook(idx, 'q')))
+                        hooks.append(layer.self_attn.k_proj.register_full_backward_hook(get_backward_hook(idx, 'k')))
+                        hooks.append(layer.self_attn.v_proj.register_full_backward_hook(get_backward_hook(idx, 'v')))
+                
                 with torch.enable_grad():
-                    # We can call model() with inputs_embeds, it skips the vision branch natively
                     outputs = model(
                         inputs_embeds=inputs_embeds,
                         attention_mask=attention_mask,
@@ -287,46 +308,55 @@ def calib_grad_info(model, dataloader, tokenizer, image_processor, args, use_cac
                     loss /= accumulation_steps
                     loss.backward()
                     
+                for h in hooks:
+                    h.remove()
+                    
                 batch_count += 1
                 if batch_count % accumulation_steps == 0:
                     for idx, layer in enumerate(model_utils.get_layers(model)):
                         if hasattr(layer.self_attn, 'qkv_svd_info'):
-                            svd_info = layer.self_attn.qkv_svd_info
-                            q_linear = layer.self_attn.q_proj
-                            k_linear = layer.self_attn.k_proj
-                            v_linear = layer.self_attn.v_proj
+                            data = captured_data.get(idx, {})
+                            if 'X' not in data:
+                                continue
                             
-                            if q_linear.weight.grad is not None and k_linear.weight.grad is not None and v_linear.weight.grad is not None:
-                                grad_cat = torch.cat([
-                                    q_linear.weight.grad.detach().to(torch.float32),
-                                    k_linear.weight.grad.detach().to(torch.float32),
-                                    v_linear.weight.grad.detach().to(torch.float32)
-                                ], dim=0)
-                                
-                                if args.act_aware:
-                                    scaling = svd_info['scaling_matrix_inverse_transpose'].to(device)
-                                    if scaling.ndim == 1:
-                                        grad_cat = grad_cat * scaling.view(1, -1).to(torch.float32)
-                                    elif scaling.ndim == 2:
-                                        grad_cat = grad_cat @ scaling.to(torch.float32)
-                                        
-                                U = svd_info['U'].to(device).to(torch.float32)
-                                V = svd_info['V'].to(device).to(torch.float32)
-                                S_grad_squared = torch.sum(U * (grad_cat @ V), dim=0).pow(2)
-                                
-                                if not hasattr(layer.self_attn, 'S_grad_info'):
-                                    layer.self_attn.S_grad_info = S_grad_squared
+                            svd_info = layer.self_attn.qkv_svd_info
+                            
+                            X = data['X'].view(-1, data['X'].shape[-1]).to(torch.float32)
+                            gY_q = data.get('gY_q', torch.zeros_like(X)).view(-1, data.get('gY_q', X).shape[-1]).to(torch.float32)
+                            gY_k = data.get('gY_k', torch.zeros_like(X)).view(-1, data.get('gY_k', X).shape[-1]).to(torch.float32)
+                            gY_v = data.get('gY_v', torch.zeros_like(X)).view(-1, data.get('gY_v', X).shape[-1]).to(torch.float32)
+                            
+                            gY_cat = torch.cat([gY_q, gY_k, gY_v], dim=-1)
+                            
+                            U = svd_info['U'].to(device).to(torch.float32)
+                            V = svd_info['V'].to(device).to(torch.float32)
+                            
+                            if args.act_aware:
+                                scaling = svd_info['scaling_matrix_inverse_transpose'].to(device).to(torch.float32)
+                                if scaling.ndim == 1:
+                                    V_scaled = V * scaling.view(-1, 1)
                                 else:
-                                    layer.self_attn.S_grad_info += S_grad_squared
-                                    
-                    model.zero_grad()
-                    torch.cuda.empty_cache()
-                    
+                                    V_scaled = scaling @ V
+                            else:
+                                V_scaled = V
+                                
+                            gY_U = gY_cat @ U
+                            X_V = X @ V_scaled
+                            
+                            S_grad_squared = torch.sum((gY_U * X_V)**2, dim=0)
+                            
+                            if not hasattr(layer.self_attn, 'S_grad_info'):
+                                layer.self_attn.S_grad_info = S_grad_squared
+                            else:
+                                layer.self_attn.S_grad_info += S_grad_squared
+                                
+                captured_data.clear()
+                torch.cuda.empty_cache()
+                
             except Exception as e:
                 logging.error(f"Error during Gradient computation: {e}")
                 import traceback
                 logging.error(traceback.format_exc())
-                model.zero_grad()
                 torch.cuda.empty_cache()
                 
         # Restore model fully to device for subsequent processing
@@ -365,6 +395,11 @@ def calib_grad_info(model, dataloader, tokenizer, image_processor, args, use_cac
     logging.info(f"Saving Grad information cache to {cache_file}...")
     torch.save(all_grad_info, cache_file)
     logging.info("Grad information cache saved successfully!")
+
+
+
+
+# ////// QSVD approch
 
 # def calib_grad_info(model, dataloader, tokenizer, image_processor, args, use_cache=True, cache_file=None):
 #     """
