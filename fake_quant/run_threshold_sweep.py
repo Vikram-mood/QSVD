@@ -49,7 +49,7 @@ def run_sweep():
     )
     
     # Define percentiles to test
-    percentiles = [0, 50, 70, 80, 90, 95, 99] # 0 is baseline
+    percentiles = [0] # 0 is baseline
     results = []
     
     # Get test loader
@@ -64,14 +64,30 @@ def run_sweep():
         args=args
     )
 
-    # Backup the original weights of attention layers so we can reset for each threshold
-    logging.info("Backing up attention layer weights...")
+    # Backup the original weights of all layers modified by GPTQ so we can reset for each threshold
+    logging.info("Backing up all linear layer weights...")
     attention_weights_backup = {}
     layers = model_utils.get_transformer_layers(model, model_utils.get_model_type(model))
     for idx, layer in enumerate(layers):
-        for name in ['q_proj', 'k_proj', 'v_proj']:
-            proj = getattr(layer.self_attn, name)
-            attention_weights_backup[(idx, name)] = proj.weight.data.clone().cpu()
+        # self_attn layers
+        for name in ['q_proj', 'k_proj', 'v_proj', 'o_proj']:
+            if hasattr(layer.self_attn, name):
+                proj = getattr(layer.self_attn, name)
+                attention_weights_backup[(idx, f'self_attn.{name}')] = proj.weight.data.clone().cpu()
+        # mlp layers
+        for name in ['up_proj', 'gate_proj', 'down_proj']:
+            if hasattr(layer.mlp, name):
+                proj = getattr(layer.mlp, name)
+                attention_weights_backup[(idx, f'mlp.{name}')] = proj.weight.data.clone().cpu()
+
+    if args.a_bits < 16 or args.v_bits < 16:
+        logging.info("Adding Activation Quantization Wrappers...")
+        if hasattr(model, 'vision_tower') and hasattr(model.vision_tower, 'vision_model'):
+            quant_utils.add_actquant(model.vision_tower.vision_model)
+        if hasattr(model, 'multi_modal_projector'):
+            quant_utils.add_actquant(model.multi_modal_projector)
+        
+        quant_utils.add_actquant(model_utils.get_layers(model))
 
     original_save_path = args.save_path
     for p in percentiles:
@@ -83,12 +99,22 @@ def run_sweep():
         
         # Reset and Apply thresholding to attention layers
         for idx, layer in enumerate(layers):
+            # Restore all weights to FP16 clean state
+            for name in ['q_proj', 'k_proj', 'v_proj', 'o_proj']:
+                if hasattr(layer.self_attn, name):
+                    proj = getattr(layer.self_attn, name)
+                    proj.weight.data.copy_(attention_weights_backup[(idx, f'self_attn.{name}')].to(device))
+            for name in ['up_proj', 'gate_proj', 'down_proj']:
+                if hasattr(layer.mlp, name):
+                    proj = getattr(layer.mlp, name)
+                    proj.weight.data.copy_(attention_weights_backup[(idx, f'mlp.{name}')].to(device))
+            
+            # Apply SVD threshold specifically on attention QKV layers
             for name in ['q_proj', 'k_proj', 'v_proj']:
-                proj = getattr(layer.self_attn, name)
-                # Restore original weight
-                proj.weight.data.copy_(attention_weights_backup[(idx, name)].to(device))
-                if p > 0:
-                    svd_utils.apply_weight_threshold(proj, p)
+                if hasattr(layer.self_attn, name):
+                    proj = getattr(layer.self_attn, name)
+                    if p > 0:
+                        svd_utils.apply_weight_threshold(proj, p)
         
         # Apply Quantization
         if args.w_bits < 16:
