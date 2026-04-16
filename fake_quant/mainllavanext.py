@@ -21,6 +21,52 @@ def get_rank_and_world_size():
     return rank, world_size
 
 
+def apply_weight_threshold(model, args):
+    if args.w_threshold is None and args.threshold_percentile is None:
+        return
+    
+    import torch
+    logging.info(f"Applying weight thresholding: threshold={args.w_threshold}, percentile={args.threshold_percentile}")
+    
+    layers_to_threshold = []
+    # Identify attention layers (Q, K, V, or QKV)
+    for name, module in model.named_modules():
+        if isinstance(module, torch.nn.Linear):
+            # LLaVA-Next language model (often Llama) uses q_proj, k_proj, v_proj
+            # Vision model (CLIP) uses q_proj, k_proj, v_proj or similar inside attention
+            if any(target in name for target in ['q_proj', 'k_proj', 'v_proj', 'qkv_proj', 'attn.qkv']):
+                layers_to_threshold.append((name, module))
+    
+    if not layers_to_threshold:
+        logging.info("No target linear layers found for thresholding.")
+        return
+
+    total_params = 0
+    total_zeros = 0
+    
+    for name, module in layers_to_threshold:
+        W = module.weight.data
+        if args.threshold_percentile is not None:
+            # Layer-wise percentile
+            t = torch.quantile(torch.abs(W).float().view(-1), args.threshold_percentile / 100.0)
+        else:
+            t = torch.tensor(args.w_threshold, device=W.device, dtype=W.dtype)
+            
+        mask = torch.abs(W) >= t
+        num_zeros = (mask == 0).sum().item()
+        total_zeros += num_zeros
+        total_params += W.numel()
+        
+        module.weight.data.mul_(mask.to(W.dtype))
+        logging.info(f"Layer {name}: threshold={t.item():.6f}, sparsity={num_zeros/W.numel():.2%}")
+        
+    if total_params > 0:
+        logging.info(f"Total Sparsity in Attention Layers: {total_zeros/total_params:.2%}")
+    
+    # Store total sparsity in args for logging/analysis
+    args.actual_sparsity = total_zeros / total_params if total_params > 0 else 0
+
+
 @torch.no_grad()
 def _profile(dataloader, args, model, image_processor, tokenizer, out=False):
     dtype = next(iter(model.parameters())).dtype
@@ -106,6 +152,10 @@ def main(args):
         logging.info(f'loading model using new tokenizer={"hf_v16_train_fix"}')
     model, tokenizer, image_processor = model_utils.get_model(args.model, args.hf_token)
     model.eval()
+    
+    # Apply thresholding if requested
+    apply_weight_threshold(model, args)
+
     modeldtype = model.dtype
     model.vision_tower.to(modeldtype)
     print(model.vision_tower.dtype)

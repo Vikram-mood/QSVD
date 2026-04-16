@@ -237,7 +237,14 @@ def parser_gen():
     parser.add_argument('--token_length', type=int, default=-1, 
         help='truncate grad info input token length')
     parser.add_argument('--case_study', action=argparse.BooleanOptionalAction, default=False,
-        help='whether use case study for evaluation, now supporting 1.5 sqa')
+                        help='whether use case study for evaluation, now supporting 1.5 sqa')
+    
+    # Threshold Sparsification Arguments
+    parser.add_argument('--w_threshold', type=float, default=None,
+                        help='Absolute threshold for weight sparsification. Weights with |W| < threshold will be zeroed.')
+    parser.add_argument('--threshold_percentile', type=float, default=None,
+                        help='Percentile for weight sparsification (0-100). The threshold will be the specified percentile of absolute weight values.')
+
     # Save/Load Quantized Model Arguments
     parser.add_argument('--load_qmodel_path', type=str, default=None,
                         help='Load the quantized model from the specified path!')
