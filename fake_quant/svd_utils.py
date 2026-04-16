@@ -1328,25 +1328,47 @@ def svd_llava_setup(model, args, tokenizer=None, image_processor=None):
     
     logging.info("Language model SVD compression completed")
 
-def apply_weight_threshold(module, threshold_percentile):
+def apply_weight_threshold(module, threshold_percentile, grad_info=None, svd_info=None):
     """
     Apply element-wise thresholding to the weight matrix of a linear module.
+    If grad_info and svd_info are provided, uses gradient-informed importance: |W * (U @ diag(I_sigma) @ V^T)|.
     threshold_percentile: float in [0, 100]
     """
     if not hasattr(module, 'weight'):
         return 0
     
     with torch.no_grad():
-        w = module.weight.data
-        abs_w = w.abs()
+        W = module.weight.data
+        if grad_info is not None and svd_info is not None:
+            # Reconstruct Importance Matrix: I_w = |W * (U @ diag(I_sigma) @ V^T)|
+            # S_grad_info (grad_info) is already sqrt-normalized if from calib_grad_info
+            U = svd_info['U'].to(W.device).to(torch.float32)
+            V = svd_info['V'].to(W.device).to(torch.float32)
+            I_sigma = grad_info.to(W.device).to(torch.float32)
+            
+            # Efficient reconstruction: (W * (U @ (I_sigma.diag() @ V.T)))
+            # Since S_grad_info is a vector, we use broadcasting
+            # G_approx shape should match W shape
+            G_approx = U @ (I_sigma.view(-1, 1) * V.t())
+            
+            # Handle the case where W is a sub-part of the original concatenated matrix (e.g. q_proj only)
+            if G_approx.shape[0] > W.shape[0]:
+                # Slice G_approx to match W (this assumes q, k, v are stacked in dim 0)
+                # We'll need to know which slice we are. For now, let's hope run_sweep handles this.
+                # Actually, better to pass the correctly sliced U in svd_info.
+                pass
+                
+            importance = torch.abs(W.to(torch.float32) * G_approx)
+        else:
+            importance = torch.abs(W).to(torch.float32)
+            
         # Use torch.quantile for efficiency
-        # Convert to float for quantile, then get the value
-        threshold_value = torch.quantile(abs_w.float().view(-1), threshold_percentile / 100.0)
-        mask = abs_w >= threshold_value
-        module.weight.data = w * mask
+        threshold_value = torch.quantile(importance.view(-1), threshold_percentile / 100.0)
+        mask = importance >= threshold_value
+        module.weight.data = (W * mask.to(W.dtype))
         
         # Calculate sparsity
-        total_elements = w.numel()
+        total_elements = W.numel()
         zero_elements = torch.sum(module.weight.data == 0).item()
         sparsity = (zero_elements / total_elements) * 100
         return sparsity

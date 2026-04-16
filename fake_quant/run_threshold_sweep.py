@@ -83,12 +83,29 @@ def run_sweep():
         
         # Reset and Apply thresholding to attention layers
         for idx, layer in enumerate(layers):
-            for name in ['q_proj', 'k_proj', 'v_proj']:
+            # Try to get Grad and SVD info for the layer
+            svd_info = getattr(layer.self_attn, 'qkv_svd_info', None)
+            grad_info = getattr(layer.self_attn, 'S_grad_info', None)
+            
+            for j, name in enumerate(['q_proj', 'k_proj', 'v_proj']):
                 proj = getattr(layer.self_attn, name)
                 # Restore original weight
                 proj.weight.data.copy_(attention_weights_backup[(idx, name)].to(device))
+                
                 if p > 0:
-                    svd_utils.apply_weight_threshold(proj, p)
+                    current_svd_info = None
+                    if svd_info is not None:
+                        # Slice U for the current projection (Q, K, or V)
+                        # Assumes q, k, v are stacked in dim 0
+                        out_features = proj.out_features
+                        U_slice = svd_info['U'][j*out_features : (j+1)*out_features, :]
+                        current_svd_info = {
+                            'U': U_slice,
+                            'V': svd_info['V'],
+                            'S': svd_info['S']
+                        }
+                    
+                    svd_utils.apply_weight_threshold(proj, p, grad_info=grad_info, svd_info=current_svd_info)
         
         # Apply Quantization
         if args.w_bits < 16:
