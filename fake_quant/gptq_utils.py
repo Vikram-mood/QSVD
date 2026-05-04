@@ -145,9 +145,10 @@ def gptq_fwrd(model, dataloader, dev, args):
     '''
     logging.info('-----GPTQ Quantization-----')
     
-    use_cache = model.config.use_cache
-    model.config.use_cache = False
-    layers = model.model.layers
+    use_cache = getattr(model.config, 'use_cache', getattr(getattr(model.config, 'text_config', object()), 'use_cache', True))
+    if hasattr(model.config, 'use_cache'): model.config.use_cache = False
+    elif hasattr(model.config, 'text_config'): model.config.text_config.use_cache = False
+    layers = model_utils.get_layers(model)
 
     model.model.embed_tokens = model.model.embed_tokens.to(dev)
     model.model.norm = model.model.norm.to(dev)
@@ -164,15 +165,28 @@ def gptq_fwrd(model, dataloader, dev, args):
             super().__init__()
             self.module = module
         def forward(self, inp, **kwargs):
-            inps[cache['i']] = inp
+            # inps[cache['i']] = inp
+            inps.append(inp[0])
             cache['i'] += 1
-            cache['attention_mask'] = kwargs['attention_mask']
-            cache['position_ids'] = kwargs['position_ids']
+            if 'attention_mask' in kwargs and kwargs['attention_mask'] is not None:
+                cache['attention_mask'].append(kwargs['attention_mask'].cpu())
+            else:
+                cache['attention_mask'].append(None)
+            if 'position_embeddings' in kwargs:
+                cache['position_embeddings'].append(kwargs['position_embeddings'])
+            else:
+                cache['position_embeddings'].append(None)
             raise ValueError
     layers[0] = Catcher(layers[0])
     for batch in dataloader:
         try:
-            model(batch[0].to(dev))
+            input_ids, images = message_to_prompt(batch, image_processor, model, tokenizer)
+            if isinstance(input_ids, dict) or "Batch" in type(input_ids).__name__:
+                # Convert BatchEncoding/Feature to plain dict to avoid type issues
+                inputs_dict = {k: v for k, v in input_ids.items()}
+                model(**inputs_dict)
+            else:
+                model(input_ids, images=images)
         except ValueError:
             pass
     layers[0] = layers[0].module
@@ -188,10 +202,10 @@ def gptq_fwrd(model, dataloader, dev, args):
 
     quantizers = {}
     sequential = [
-                ['self_attn.k_proj.module', 'self_attn.v_proj.module', 'self_attn.q_proj.module'],
-                ['self_attn.o_proj.module'],
-                ['mlp.up_proj.module', 'mlp.gate_proj.module'],
-                ['mlp.down_proj.module']
+                ['self_attn.k_proj', 'self_attn.v_proj', 'self_attn.q_proj'],
+                ['self_attn.o_proj'],
+                ['mlp.up_proj', 'mlp.gate_proj'],
+                ['mlp.down_proj']
             ]
     for i in range(len(layers)):
         print(f'\nLayer {i}:', flush=True, end=' ')
@@ -247,7 +261,8 @@ def gptq_fwrd(model, dataloader, dev, args):
 
         inps, outs = outs, inps
 
-    model.config.use_cache = use_cache
+    if hasattr(model.config, 'use_cache'): model.config.use_cache = use_cache
+    elif hasattr(model.config, 'text_config'): model.config.text_config.use_cache = use_cache
     utils.cleanup_memory(verbos=True)
     logging.info('-----GPTQ Quantization Done-----\n')
     return quantizers
@@ -261,15 +276,17 @@ def gptq_fwrdllava(model, dataloader, dev, args, tokenizer=None, image_processor
     '''
     logging.info('-----GPTQ Quantization-----')
     dataloader, _ = dataloader
-    use_cache = model.config.use_cache
-    model.config.use_cache = False
-    layers = model.model.layers
+    use_cache = getattr(model.config, 'use_cache', getattr(getattr(model.config, 'text_config', object()), 'use_cache', True))
+    if hasattr(model.config, 'use_cache'): model.config.use_cache = False
+    elif hasattr(model.config, 'text_config'): model.config.text_config.use_cache = False
+    layers = model_utils.get_layers(model)
 
-    model.model.embed_tokens = model.model.embed_tokens.to(dev)
-    model.model.norm = model.model.norm.to(dev)
-    model.model.rotary_emb = model.model.rotary_emb.to(dev)
-    model.model.mm_projector = model.model.mm_projector.to(dev)
-    model.model.vision_tower = model.model.vision_tower.to(dev)
+    model_type = model_utils.model_type_extractor(model)
+    for emb in model_utils.get_embeddings(model, model_type): emb.to(dev)
+    model_utils.get_pre_head_layernorm(model, model_type).to(dev)
+    if hasattr(model, "model") and hasattr(model.model, "rotary_emb"): model.model.rotary_emb.to(dev)
+    if hasattr(model, "multi_modal_projector") and model.multi_modal_projector is not None: model.multi_modal_projector.to(dev)
+    if hasattr(model, "vision_tower") and model.vision_tower is not None: model.vision_tower.to(dev)
     layers[0] = layers[0].to(dev)
 
     dtype = next(iter(model.parameters())).dtype
@@ -287,32 +304,34 @@ def gptq_fwrdllava(model, dataloader, dev, args, tokenizer=None, image_processor
             # inps[cache['i']] = inp
             inps.append(inp[0])
             cache['i'] += 1
-            cache['attention_mask'].append(kwargs['attention_mask'].cpu())
-            cache['position_embeddings'].append(kwargs['position_embeddings'])
+            if 'attention_mask' in kwargs and kwargs['attention_mask'] is not None:
+                cache['attention_mask'].append(kwargs['attention_mask'].cpu())
+            else:
+                cache['attention_mask'].append(None)
+            if 'position_embeddings' in kwargs:
+                cache['position_embeddings'].append(kwargs['position_embeddings'])
+            else:
+                cache['position_embeddings'].append(None)
             raise ValueError
     layers[0] = Catcher(layers[0])
     for batch in dataloader:
         try:
-            # model(batch[0].to(dev))
             input_ids, images = message_to_prompt(batch, image_processor, model, tokenizer)
-            from llava.constants import IMAGE_TOKEN_INDEX
-            # num_images = (input_ids == IMAGE_TOKEN_INDEX).sum()
-            # print(num_images)
-            model.generate(input_ids, images=images,
-                            do_sample=False,
-                            temperature=0,
-                            max_new_tokens=512,
-                            use_cache=True,)
+            if isinstance(input_ids, dict) or "Batch" in type(input_ids).__name__:
+                inputs_dict = {k: v for k, v in input_ids.items()}
+                model(**inputs_dict)
+            else:
+                model(input_ids, images=images)
         except ValueError:
             pass
     layers[0] = layers[0].module
 
     layers[0] = layers[0].cpu()
-    model.model.embed_tokens = model.model.embed_tokens.cpu()
-    model.model.norm = model.model.norm.cpu()
-    model.model.rotary_emb = model.model.rotary_emb.cpu()
-    model.model.mm_projector = model.model.mm_projector.cpu()
-    model.model.vision_tower = model.model.vision_tower.cpu()
+    for emb in model_utils.get_embeddings(model, model_type): emb.cpu()
+    model_utils.get_pre_head_layernorm(model, model_type).cpu()
+    if hasattr(model, "model") and hasattr(model.model, "rotary_emb"): model.model.rotary_emb.cpu()
+    if hasattr(model, "multi_modal_projector") and model.multi_modal_projector is not None: model.multi_modal_projector.cpu()
+    if hasattr(model, "vision_tower") and model.vision_tower is not None: model.vision_tower.cpu()
     torch.cuda.empty_cache()
 
     outs = [None] * args.nsamples 
@@ -321,10 +340,10 @@ def gptq_fwrdllava(model, dataloader, dev, args, tokenizer=None, image_processor
 
     quantizers = {}
     sequential = [
-                ['self_attn.k_proj.module', 'self_attn.v_proj.module', 'self_attn.q_proj.module'],
-                ['self_attn.o_proj.module'],
-                ['mlp.up_proj.module', 'mlp.gate_proj.module'],
-                ['mlp.down_proj.module']
+                ['self_attn.k_proj', 'self_attn.v_proj', 'self_attn.q_proj'],
+                ['self_attn.o_proj'],
+                ['mlp.up_proj', 'mlp.gate_proj'],
+                ['mlp.down_proj']
             ]
     for i in range(len(layers)):
         print(f'\nLayer {i}:', flush=True, end=' ')
@@ -359,7 +378,7 @@ def gptq_fwrdllava(model, dataloader, dev, args, tokenizer=None, image_processor
             for j in range(args.nsamples):
                 # attention_mask = inps. 
                 # position_embeddings = 
-                outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_mask[j].to(dev), position_embeddings=position_embeddings[j])[0][0]
+                outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_mask[j].to(dev) if attention_mask[j] is not None else None, position_embeddings=position_embeddings[j])[0][0]
                 
             for h in handles:
                 h.remove()
@@ -373,7 +392,7 @@ def gptq_fwrdllava(model, dataloader, dev, args, tokenizer=None, image_processor
                 gptq[name].free()
 
         for j in range(args.nsamples):
-            outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_mask[j].to(dev), position_embeddings=position_embeddings[j])[0][0]# as we have list instead of tensor
+            outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_mask[j].to(dev) if attention_mask[j] is not None else None, position_embeddings=position_embeddings[j])[0][0]# as we have list instead of tensor
 
         layers[i] = layer.cpu()
         del layer
@@ -382,7 +401,8 @@ def gptq_fwrdllava(model, dataloader, dev, args, tokenizer=None, image_processor
 
         inps, outs = outs, inps
 
-    model.config.use_cache = use_cache
+    if hasattr(model.config, 'use_cache'): model.config.use_cache = use_cache
+    elif hasattr(model.config, 'text_config'): model.config.text_config.use_cache = use_cache
     utils.cleanup_memory(verbos=True)
     logging.info('-----GPTQ Quantization Done-----\n')
     return quantizers
@@ -396,14 +416,16 @@ def gptq_fwrdvit(model, dataloader, dev, args, tokenizer=None, image_processor=N
     '''
     logging.info('-----GPTQ vit Quantization-----')
     dataloader, _ = dataloader
-    use_cache = model.config.use_cache
-    model.config.use_cache = False
+    use_cache = getattr(model.config, 'use_cache', getattr(getattr(model.config, 'text_config', object()), 'use_cache', True))
+    if hasattr(model.config, 'use_cache'): model.config.use_cache = False
+    elif hasattr(model.config, 'text_config'): model.config.text_config.use_cache = False
     layers = model.model.vision_tower.vision_tower.vision_model.encoder.layers
 
-    # model.model.embed_tokens = model.model.embed_tokens.to(dev)
-    # model.model.norm = model.model.norm.to(dev)
-    # model.model.rotary_emb = model.model.rotary_emb.to(dev)
-    # model.model.mm_projector = model.model.mm_projector.to(dev)
+    model_type = model_utils.model_type_extractor(model)
+    for emb in model_utils.get_embeddings(model, model_type): emb.to(dev)
+    model_utils.get_pre_head_layernorm(model, model_type).to(dev)
+    if hasattr(model, "model") and hasattr(model.model, "rotary_emb"): model.model.rotary_emb.to(dev)
+    if hasattr(model, "multi_modal_projector") and model.multi_modal_projector is not None: model.multi_modal_projector.to(dev)
     layers[0] = layers[0].to(dev)
 
     dtype = next(iter(model.model.vision_tower.vision_tower.vision_model.parameters())).dtype
@@ -429,25 +451,21 @@ def gptq_fwrdvit(model, dataloader, dev, args, tokenizer=None, image_processor=N
     layers[0] = Catcher(layers[0])
     for batch in dataloader:
         try:
-            # model(batch[0].to(dev))
             input_ids, images = message_to_prompt(batch, image_processor, model, tokenizer)
-            from llava.constants import IMAGE_TOKEN_INDEX
-            # num_images = (input_ids == IMAGE_TOKEN_INDEX).sum()
-            # print(num_images)
-            model.generate(input_ids, images=images,
-                            do_sample=False,
-                            temperature=0,
-                            max_new_tokens=512,
-                            use_cache=True,)
+            if isinstance(input_ids, dict) or "Batch" in type(input_ids).__name__:
+                inputs_dict = {k: v for k, v in input_ids.items()}
+                model(**inputs_dict)
+            else:
+                model(input_ids, images=images)
         except ValueError:
             pass
     layers[0] = layers[0].module
 
     layers[0] = layers[0].cpu()
-    # model.model.embed_tokens = model.model.embed_tokens.cpu()
-    # model.model.norm = model.model.norm.cpu()
-    # model.model.rotary_emb = model.model.rotary_emb.cpu()
-    # model.model.mm_projector = model.model.mm_projector.cpu()
+    for emb in model_utils.get_embeddings(model, model_type): emb.cpu()
+    model_utils.get_pre_head_layernorm(model, model_type).cpu()
+    if hasattr(model, "model") and hasattr(model.model, "rotary_emb"): model.model.rotary_emb.cpu()
+    if hasattr(model, "multi_modal_projector") and model.multi_modal_projector is not None: model.multi_modal_projector.cpu()
     torch.cuda.empty_cache()
 
     outs = torch.zeros_like(inps)
@@ -456,10 +474,10 @@ def gptq_fwrdvit(model, dataloader, dev, args, tokenizer=None, image_processor=N
 
     quantizers = {}
     sequential = [
-                ['self_attn.k_proj.module', 'self_attn.v_proj.module', 'self_attn.q_proj.module'],
-                ['self_attn.out_proj.module'],
-                ['mlp.fc1.module'],
-                ['mlp.fc2.module']
+                ['self_attn.k_proj', 'self_attn.v_proj', 'self_attn.q_proj'],
+                ['self_attn.out_proj'],
+                ['mlp.fc1'],
+                ['mlp.fc2']
             ]
     for i in range(len(layers)):
         print(f'\nLayer {i}:', flush=True, end=' ')
@@ -518,7 +536,8 @@ def gptq_fwrdvit(model, dataloader, dev, args, tokenizer=None, image_processor=N
 
         inps, outs = outs, inps
 
-    model.config.use_cache = use_cache
+    if hasattr(model.config, 'use_cache'): model.config.use_cache = use_cache
+    elif hasattr(model.config, 'text_config'): model.config.text_config.use_cache = use_cache
     utils.cleanup_memory(verbos=True)
     logging.info('-----GPTQ vit Quantization Done-----\n')
     return quantizers
@@ -532,8 +551,9 @@ def gptq_fwrdmm(model, dataloader, dev, args, tokenizer=None, image_processor=No
     '''
     logging.info('-----GPTQ mm Quantization-----')
     dataloader, _ = dataloader
-    use_cache = model.config.use_cache
-    model.config.use_cache = False
+    use_cache = getattr(model.config, 'use_cache', getattr(getattr(model.config, 'text_config', object()), 'use_cache', True))
+    if hasattr(model.config, 'use_cache'): model.config.use_cache = False
+    elif hasattr(model.config, 'text_config'): model.config.text_config.use_cache = False
     layers = model.model
 
     model.model.vision_tower.vision_tower.vision_model.encoder.layers = model.model.vision_tower.vision_tower.vision_model.encoder.layers.to(dev)
@@ -558,16 +578,12 @@ def gptq_fwrdmm(model, dataloader, dev, args, tokenizer=None, image_processor=No
     layers.mm_projector = Catcher(layers.mm_projector)
     for batch in dataloader:
         try:
-            # model(batch[0].to(dev))
             input_ids, images = message_to_prompt(batch, image_processor, model, tokenizer)
-            from llava.constants import IMAGE_TOKEN_INDEX
-            # num_images = (input_ids == IMAGE_TOKEN_INDEX).sum()
-            # print(num_images)
-            model.generate(input_ids, images=images,
-                            do_sample=False,
-                            temperature=0,
-                            max_new_tokens=512,
-                            use_cache=True,)
+            if isinstance(input_ids, dict) or "Batch" in type(input_ids).__name__:
+                inputs_dict = {k: v for k, v in input_ids.items()}
+                model(**inputs_dict)
+            else:
+                model(input_ids, images=images)
         except ValueError:
             pass
     # layers[0] = layers[0].module
@@ -638,7 +654,8 @@ def gptq_fwrdmm(model, dataloader, dev, args, tokenizer=None, image_processor=No
 
     inps, outs = outs, inps
 
-    model.config.use_cache = use_cache
+    if hasattr(model.config, 'use_cache'): model.config.use_cache = use_cache
+    elif hasattr(model.config, 'text_config'): model.config.text_config.use_cache = use_cache
     utils.cleanup_memory(verbos=True)
     logging.info('-----GPTQ mm Quantization Done-----\n')
     return quantizers
@@ -899,8 +916,7 @@ def message_to_prompt(message, image_processor, model, tokenizer):
         prompt = image_processor.apply_chat_template(
         conversation, add_generation_prompt=True
         )
-        inputs = image_processor(prompt, images, return_tensors="pt").to(
-                    "cuda", torch.float16)
+        inputs = image_processor(prompt, images, return_tensors="pt").to("cuda")
         return inputs, None
     system_prompt = (
             "A chat between a curious human and an artificial intelligence assistant. "

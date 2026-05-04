@@ -35,3 +35,27 @@ We refactored the code to use a mathematically equivalent but computationally su
 | **Compute Method** | Post-processing 4096x4096 arrays | On-the-fly hook interception | Eliminated fragmentation |
 | **Time per Batch** | ~19.3 seconds | ~1.6 seconds | **~12x Faster** |
 | **System Stability** | Severe risk of OOM on 32GB GPUs | Flat & stable memory footprint | **100% OOM Free** |
+
+## 5. Application: Sparse Quantization (Thresholding Sweep)
+We applied our optimized gradient computation to a weight thresholding sweep in a W4A4 (4-bit Weight and Activation) configuration on the ScienceQA benchmark. 
+
+### 5.1. Results: Accuracy vs. Threshold Percentile
+Thresholding was applied to attention layers (Q, K, V) **prior to GPTQ quantization**.
+
+| Threshold Percentile | Actual Sparsity | Accuracy (ScienceQA) |
+| :--- | :--- | :--- |
+| **0% (Dense Baseline)** | 21.9% | 57.7% |
+| **50% (Mid-Threshold)** | **27.7%** | **60.5% (↑ 2.8%)** |
+| **70%** | 32.2% | 4.3% (Collapse) |
+| **80%** | 34.5% | 2.4% |
+| **95%** | 38.0% | 0.9% |
+
+### 5.2. Analysis of the "Thresholding Boost"
+A significant discovery is the **2.8% absolute accuracy improvement** when 50% of the weights are thresholded before quantization. 
+
+- **Implicit Regularization:** By zeroing out low-magnitude/low-importance weights before the GPTQ solver runs, we significantly reduce the "noise" that the quantization process tries to compensate for.
+- **Quantization Efficiency:** The GPTQ algorithm is able to find a more optimal 4-bit representation for the remaining "high-signal" weights, leading to a model that generalizes better than the dense 4-bit baseline.
+- **Sparsity Horizon:** The model remains robust until approximately 30% absolute sparsity (50th percentile of attention weights), after which the information loss becomes too severe for the 4nd-order GPTQ solver to recover.
+
+## 6. Conclusion
+The combination of **Projection-Hook Gradient Estimation** and **Thresholding-before-Quantization** represents a powerful pipeline for VLM compression. We achieved a **12x reduction in calibration time** while simultaneously **improving 4-bit accuracy by 2.8%** through strategic weight sparsification.
